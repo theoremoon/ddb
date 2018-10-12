@@ -1,0 +1,9 @@
+{
+	"name": "ddebugger",
+	"authors": [
+		"theoldmoon0602"
+	],
+	"description": "experimental implementation of debugger with unlimited hardware breakpoint",
+	"copyright": "Copyright © 2018, theoldmoon0602",
+	"license": "MIT"
+}
