@@ -5,12 +5,22 @@ import std.file;
 import std.algorithm;
 import std.bitmanip;
 import debugger.exception;
+import core.stdc.string;
+import std.conv;
+
+struct Function {
+  public:
+    string name;
+    ulong address;
+    ulong length;
+}
 
 abstract class ELF {
   public:
-    ulong entryPoint();
-    uint bitLength();
-    ulong registerOf(ubyte[], string);
+    abstract ulong entryPoint();
+    abstract uint bitLength();
+    abstract ulong registerOf(ubyte[], string);
+    abstract Function[] functions();
 }
 
 ELF readELF(string filename) {
@@ -57,12 +67,16 @@ class ELF32 : ELF {
     }
 
     override ulong registerOf(ubyte[] reg_struct, string reg_name) { return 0; }
+    override Function[] functions() { return []; }
 }
 
 class ELF64 : ELF {
   protected:
     ubyte[] data;
     Elf64_Ehdr ehdr;
+    ulong[string] section_offsets;
+    // Symbol[string] symbols;
+
   public:
     this(string filename) {
       data = cast(ubyte[])read(filename);
@@ -73,6 +87,36 @@ class ELF64 : ELF {
       }
       if (ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
         throw new DebuggerException("not a 32bit ELF file");
+      }
+
+      this.analyze();
+    }
+
+    Elf64_Shdr getSection(string section_name) {
+      char[] name = section_name.dup;
+      if (name[0] != '.') {
+        name = '.' ~ name;
+      }
+
+      if (auto offset = name in section_offsets) {
+        return *cast(Elf64_Shdr*)(data.ptr + *offset);
+      }
+      throw new DebuggerException("invalid section name: " ~ section_name);
+    }
+
+    /// Analyze ELF structure
+    /// sections, symbols and relocatables
+    void analyze() {
+      section_offsets[".symstrtab"] = cast(ulong)(ehdr.e_shoff + ehdr.e_shentsize * ehdr.e_shstrndx);  // .symstrtab
+      auto symstrtab = this.getSection(".symstrtab");
+
+      // linear search all sections
+      foreach (i; 0..ehdr.e_shnum) {
+        auto section = cast(Elf64_Shdr*)(data.ptr + ehdr.e_shoff + ehdr.e_shentsize * i);
+        
+        // .strtab
+        auto section_name = (cast(char*)(data.ptr + symstrtab.sh_offset + section.sh_name)).to!string();
+        section_offsets[section_name] = cast(ulong)(ehdr.e_shoff + ehdr.e_shentsize * i);
       }
     }
 
@@ -101,6 +145,27 @@ class ELF64 : ELF {
       }
 
       throw new DebuggerException("invalid register name: " ~ reg_name);
+    }
+
+    override Function[] functions() {
+      Function[] funcs = [];
+      auto symstrtab = this.getSection(".strtab");
+      auto strtab = this.getSection(".strtab");
+      auto symtab = this.getSection(".symtab");
+
+      // loop all symbols
+      foreach (i; 0..(symtab.sh_size / symtab.sh_entsize)) {
+        auto sym = cast(Elf64_Sym*)(data.ptr + symtab.sh_offset + symtab.sh_entsize * i);
+        if (ELF64_ST_TYPE(sym.st_info) == STT_FUNC) {
+          funcs ~= Function(
+            (cast(char*)(data.ptr + strtab.sh_offset + sym.st_name)).to!string(),
+            sym.st_value,
+            sym.st_size,
+          );
+        }
+      }
+      
+      return funcs;
     }
 }
 
