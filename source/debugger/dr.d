@@ -19,14 +19,17 @@ enum BreakLength{
 
 // DR7 レジスタの内部構造 32bit
 alias dr7_t = uint;
-auto set_local(ref dr7_t r, long i, long v) {
-  return r |= (v & 1) << (i * 2);
+auto set_local(ref dr7_t r, uint i, uint v) {
+  uint x = (v & 1) << (i * 2);
+  return r = (r & (~x)) | x;
 }
-auto set_RW(ref dr7_t r, long i, long v) {
-  return r |= (v & 0b11) << (i * 4 + 16);
+auto set_RW(ref dr7_t r, uint i, uint v) {
+  uint x = (v & 0b11) << (i * 4 + 16);
+  return r = (r & (~x)) | x;
 }
-auto set_length(ref dr7_t r, long i, long v) {
-  return r |= (v & 0b11) << (i * 4 + 18);
+auto set_length(ref dr7_t r, uint i, uint v) {
+  uint x = (v & 0b11) << (i * 4 + 18);
+  return r = (r & (~x)) | x;
 }
 
 long offsetof_dr(long i) {
@@ -34,7 +37,7 @@ long offsetof_dr(long i) {
 }
 
 // pid のプロセスの addr の位置に HW BP を設置する。 DRr 番を用いる
-bool set_hw_breakpoint_to(pid_t pid, ulong addr, long r) {
+bool set_hw_breakpoint_to(pid_t pid, ulong addr, uint r) {
   if (!(0 <= r && r < 4)) {
     return false;
   }
@@ -45,8 +48,9 @@ bool set_hw_breakpoint_to(pid_t pid, ulong addr, long r) {
     return false;
   }
 
+  dr7_t dr7 = cast(uint)(ptrace(PTRACE_PEEKUSER, pid, cast(void*)offsetof_dr(7), null));
+
   // 必要な情報を書き込む
-  dr7_t dr7 = 0;
   dr7.set_local(r, 1);  // local enable for braekpoint in DRr
   dr7.set_RW(r, BreakOn.EXEC);  // when that address is executed 
   dr7.set_length(r, BreakLength.LEN1);
