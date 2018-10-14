@@ -7,6 +7,9 @@
 	"copyright": "Copyright © 2018, theoldmoon0602",
 	"license": "MIT",
   "dependencies": {
-    "editline-d": "~>0.0.1"
+    "editline-d": "~>0.0.1",
+    "dapstone": {
+      "path": "../code/d/dapstone"
+    }
   }
 }

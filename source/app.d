@@ -11,8 +11,10 @@ import debugger;
 import core.sys.posix.sys.wait;
 import core.stdc.stdlib;
 import editline;
+import dapstone;
 
 string elf_name;
+Capstone cs;
 ELF elf = null;
 bool target_running = false;
 bool first_break = true;
@@ -56,9 +58,26 @@ void ddb_new_breakpoint(ulong addr) {
 void ddb_list_functions() {
   // 関数の一覧を出してみる
   foreach (f; elf.functions()) {
-    if (f.length > 0) {
-      ddb_msg("0x%x\t\t%s".format(f.address, f.name));
+    if (f.opbytes.length > 0) {
+      ddb_msg("0x%x\t\t%s".format(f.addr, f.name));
     }
+  }
+}
+
+void ddb_disasm_function(string name) {
+  bool f_exists = false;
+  foreach (f; elf.functions()) {
+    if (f.name == name) {
+      f_exists = true;
+      foreach (ir; cs.disasm(f.opbytes, f.addr)) {
+        ddb_msg("0x%08x  %s %s".format(ir.addr, ir.opcode, ir.operand));
+      }
+      break;
+    }
+  }
+
+  if (!f_exists) {
+    ddb_log("no such function: " ~ name, false);
   }
 }
 
@@ -107,7 +126,7 @@ Tuple!(string[], string) ddb_read() {
 }
 
 bool ddb_eval(string[] cmd) {
-  bool continue_repl = false;
+  bool continue_repl = true;
 
   switch (cmd[0]) {
     case "b":
@@ -126,23 +145,30 @@ bool ddb_eval(string[] cmd) {
       }
 
       ddb_new_breakpoint(addr);
-      continue_repl = true;
       break;
 
     case "fls":
     case "functions":
       ddb_list_functions();
-      continue_repl = true;
+      break;
+
+    case "d":
+    case "disasm":
+      if (cmd.length == 1) {
+        ddb_log("<Usage>: disasm func", false);
+        break;
+      }
+      ddb_disasm_function(cmd[1]);
       break;
 
     case "s":
     case "start":
       if (target_running) {
         ddb_log("program already running", false);
-        continue_repl = true;
         break;
       }
 
+      continue_repl = false;
       if (cmd.length == 1) {
         ddb_start([]);
       } else {
@@ -154,10 +180,10 @@ bool ddb_eval(string[] cmd) {
     case "continue":
       if (!target_running) {
         ddb_log("program isn't running", false);
-        continue_repl = true;
         break;
       }
 
+      continue_repl = false;
       ptrace(PTRACE_CONT, pid, null, null);
       break;
 
@@ -174,15 +200,14 @@ bool ddb_eval(string[] cmd) {
         ddb_msg("[s]tart [args]");
       }
       ddb_msg("[b]reak addr");
+      ddb_msg("[d]isasm function");
       ddb_msg("functions|lfs");
       ddb_msg("[h]elp|?");
       ddb_msg("exit");
 
-      continue_repl = true;
       break;
     default:
       ddb_log("invalid command: " ~ cmd[0], false);
-      continue_repl = true;
       break;
   }
   return continue_repl;
@@ -198,6 +223,11 @@ void main(string[] args)
   // ELF を解析
   elf_name = args[1];
   elf = readELF(elf_name);
+  if (cast(ELF32)(elf) !is null) {
+    cs = new Capstone(cs_arch.CS_ARCH_X86, cs_mode.CS_MODE_32);
+  } else if (cast(ELF64)(elf) !is null) {
+    cs = new Capstone(cs_arch.CS_ARCH_X86, cs_mode.CS_MODE_64);
+  }
 
   while (true) {
     // wait break

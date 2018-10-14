@@ -11,8 +11,8 @@ import std.conv;
 struct Function {
   public:
     string name;
-    ulong address;
-    ulong length;
+    ulong addr;
+    ubyte[] opbytes;
 }
 
 abstract class ELF {
@@ -152,6 +152,7 @@ class ELF64 : ELF {
       auto symstrtab = this.getSection(".strtab");
       auto strtab = this.getSection(".strtab");
       auto symtab = this.getSection(".symtab");
+      auto text = this.getSection(".text");
 
       // loop all symbols
       foreach (i; 0..(symtab.sh_size / symtab.sh_entsize)) {
@@ -160,12 +161,16 @@ class ELF64 : ELF {
           funcs ~= Function(
             (cast(char*)(data.ptr + strtab.sh_offset + sym.st_name)).to!string(),
             sym.st_value,
-            sym.st_size,
+            (cast(ubyte*)(data.ptr + text.sh_offset + sym.st_value - text.sh_addr))[0..sym.st_size]
           );
         }
       }
       
       return funcs;
+    }
+
+    auto e_entry() {
+      return ehdr.e_entry;
     }
 }
 
