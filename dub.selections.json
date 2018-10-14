@@ -1,6 +1,7 @@
 {
 	"fileVersion": 1,
 	"versions": {
+		"editline-d": "0.0.1",
 		"syscall-d": "0.4.0"
 	}
 }

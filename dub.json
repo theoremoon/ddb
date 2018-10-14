@@ -1,9 +1,12 @@
 {
-	"name": "ddebugger",
+	"name": "ddb",
 	"authors": [
 		"theoldmoon0602"
 	],
 	"description": "experimental implementation of debugger with unlimited hardware breakpoint",
 	"copyright": "Copyright © 2018, theoldmoon0602",
-	"license": "MIT"
+	"license": "MIT",
+  "dependencies": {
+    "editline-d": "~>0.0.1"
+  }
 }
