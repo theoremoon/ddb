@@ -20,7 +20,7 @@ abstract class ELF {
     abstract ulong entryPoint();
     abstract uint bitLength();
     abstract ulong registerOf(ubyte[], string);
-    abstract Function[] functions();
+    abstract Function[string] functions();
 }
 
 ELF readELF(string filename) {
@@ -67,7 +67,10 @@ class ELF32 : ELF {
     }
 
     override ulong registerOf(ubyte[] reg_struct, string reg_name) { return 0; }
-    override Function[] functions() { return []; }
+    override Function[string] functions() { 
+      Function[string] fs;
+      return fs;
+    }
 }
 
 class ELF64 : ELF {
@@ -147,8 +150,8 @@ class ELF64 : ELF {
       throw new DebuggerException("invalid register name: " ~ reg_name);
     }
 
-    override Function[] functions() {
-      Function[] funcs = [];
+    override Function[string] functions() {
+      Function[string] funcs;
       auto symstrtab = this.getSection(".strtab");
       auto strtab = this.getSection(".strtab");
       auto symtab = this.getSection(".symtab");
@@ -158,8 +161,9 @@ class ELF64 : ELF {
       foreach (i; 0..(symtab.sh_size / symtab.sh_entsize)) {
         auto sym = cast(Elf64_Sym*)(data.ptr + symtab.sh_offset + symtab.sh_entsize * i);
         if (ELF64_ST_TYPE(sym.st_info) == STT_FUNC) {
-          funcs ~= Function(
-            (cast(char*)(data.ptr + strtab.sh_offset + sym.st_name)).to!string(),
+          auto f_name = (cast(char*)(data.ptr + strtab.sh_offset + sym.st_name)).to!string();
+          funcs[f_name] = Function(
+            f_name,
             sym.st_value,
             (cast(ubyte*)(data.ptr + text.sh_offset + sym.st_value - text.sh_addr))[0..sym.st_size]
           );
@@ -167,10 +171,6 @@ class ELF64 : ELF {
       }
       
       return funcs;
-    }
-
-    auto e_entry() {
-      return ehdr.e_entry;
     }
 }
 

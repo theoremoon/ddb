@@ -4,14 +4,21 @@ import std.process;
 import std.string;
 import std.typecons;
 import std.conv;
+import std.range;
 import std.array;
 import std.algorithm;
+import std.exception;
 import std.format;
 import debugger;
 import core.sys.posix.sys.wait;
 import core.stdc.stdlib;
 import editline;
 import dapstone;
+
+static class DDBException : Exception
+{
+    mixin basicExceptionCtors;
+}
 
 string elf_name;
 Capstone cs;
@@ -22,14 +29,109 @@ pid_t pid = 0;
 ulong[] break_addrs = [];
 ubyte[] regs = [];
 string[] messages = [];
+string[] prefixes = [];
+
+alias AsmBlocks = Tuple!(ubyte[], ulong[])[ulong];
+
+AsmBlocks make_jumpgraph(debugger.Function f) {
+  AsmBlocks blocks;
+
+  const auto start_addr = f.addr;
+  const auto end_addr = f.addr + f.opbytes.length;
+  const auto irs = cs.disasm(f.opbytes, f.addr);
+
+  ulong[] offsetof;
+  ulong[ulong] addr_to_index;
+  ulong addr = 0;
+  foreach (i, ir; irs) {
+    offsetof ~= addr;
+    addr_to_index[ir.addr] = i;
+    addr += ir.bytes.length;
+  }
+
+
+  void delegate(ulong) loopf;
+  loopf = (ulong i) {
+    const auto start_i = i;
+    for (; i < irs.length; i++) {
+      switch (irs[i].opcode) {
+        case "jmp":
+          auto target = irs[i].operand.stripLeft("0x").stripLeft("0X").to!ulong(16);
+          if (!(start_addr <= target && target <= end_addr)) {
+            throw new DDBException("unsupported jump target");
+          }
+          blocks[irs[start_i].addr] = tuple(f.opbytes[offsetof[start_i]..offsetof[i] + irs[i].bytes.length], [target]);
+          if (target !in blocks) {
+            loopf(addr_to_index[target]);
+          }
+          return;
+        case "je":
+        case "jne":
+        case "jb":
+        case "jbe":
+        case "jl":
+        case "jle":
+          auto target1 = irs[i].operand.stripLeft("0x").stripLeft("0X").to!ulong(16);
+          if (!(start_addr <= target1 && target1 <= end_addr)) {
+            throw new DDBException("unsupported jump target");
+          }
+          auto target2 = irs[i + 1].addr;
+          if (!(start_addr <= target2 && target2 <= end_addr)) {
+            throw new DDBException("unsupported jump target");
+          }
+
+          blocks[irs[start_i].addr] = tuple(f.opbytes[offsetof[start_i]..offsetof[i] + irs[i].bytes.length], [target1, target2]);
+          if (target1 !in blocks) {
+            loopf(addr_to_index[target1]);
+          }
+          if (target2 !in blocks) {
+            loopf(addr_to_index[target2]);
+          }
+          return;
+        default:
+          break;
+      }
+    }
+    if (i == irs.length) {
+      blocks[irs[start_i].addr] = tuple(f.opbytes[offsetof[start_i]..offsetof[i-1] + irs[i-1].bytes.length], cast(ulong[])[]);
+    }
+  };
+  loopf(0);
+
+  return blocks;
+}
+
+void ddb_make_jumpgraph(string entry_function) {
+  const auto functions = elf.functions();
+  if (entry_function !in functions) {
+    ddb_log("function does not exist: " ~ entry_function, false);
+    return;
+  }
+  auto f = functions[entry_function];
+
+}
 
 void ddb_msg(string message) {
-  messages ~= message;
+  char[] msg = [];
+  foreach (p; prefixes) {
+    msg ~= p.dup;
+  }
+  messages ~= (msg.idup ~ message);
+}
+
+void ddb_push_prefix(string p) {
+  prefixes ~= p;
+}
+
+void ddb_pop_prefix() {
+  if (prefixes.length > 0) {
+    prefixes.popBackN(1);
+  }
 }
 
 void ddb_log(string message, bool positive=true) {
   auto prefix = positive? "[+]" : "[-]";
-  messages ~= prefix ~ message;
+  writeln(prefix ~ message);
 }
 
 void ddb_exit() {
@@ -57,28 +159,33 @@ void ddb_new_breakpoint(ulong addr) {
 
 void ddb_list_functions() {
   // 関数の一覧を出してみる
-  foreach (f; elf.functions()) {
+  foreach (_, f; elf.functions()) {
     if (f.opbytes.length > 0) {
       ddb_msg("0x%x\t\t%s".format(f.addr, f.name));
     }
   }
 }
 
-void ddb_disasm_function(string name) {
-  bool f_exists = false;
-  foreach (f; elf.functions()) {
-    if (f.name == name) {
-      f_exists = true;
-      foreach (ir; cs.disasm(f.opbytes, f.addr)) {
-        ddb_msg("0x%08x  %s %s".format(ir.addr, ir.opcode, ir.operand));
-      }
-      break;
-    }
+string format_opbytes(ubyte[] bytes) {
+  string[] buf = [];
+  foreach (b; bytes) {
+    buf ~= "%02x".format(b);
   }
+  return buf.join(" ");
+}
 
-  if (!f_exists) {
-    ddb_log("no such function: " ~ name, false);
-  }
+void ddb_disasm_bytes(ubyte[] opbytes, ulong addr) {
+    string[] opbytes_str = [];
+    auto irs = cs.disasm(opbytes, addr);
+    foreach (ir; irs) {
+      opbytes_str ~= ir.bytes.format_opbytes();
+    }
+    // long pad_length = opbytes_str.map!(x => x.length).reduce!((a, b) => max(a, b));
+    const long pad_length = 32;
+
+    foreach (i, ir; irs) {
+      ddb_msg("0x%x\t%s\t%s %s".format(ir.addr, opbytes_str[i].leftJustifier(pad_length), ir.opcode, ir.operand));
+    }
 }
 
 void ddb_start(string[] args) {
@@ -129,6 +236,34 @@ bool ddb_eval(string[] cmd) {
   bool continue_repl = true;
 
   switch (cmd[0]) {
+    case "g":
+    case "jump_graph":
+      if (cmd.length < 2) {
+        ddb_log("<Usage>: jump_graph func [-a]", false);
+        break;
+      }
+      if (auto func = cmd[1] in elf.functions()) {
+        auto graph = make_jumpgraph(*func);
+        foreach (addr; graph.keys.sort) {
+          char[] msg = "0x%x:".format(addr).dup;
+          if (graph[addr][1].length > 0) {
+            foreach (j; graph[addr][1]) {
+              msg ~= " -->0x%x".format(j);
+            }
+          }
+
+          ddb_msg(cast(string)msg);
+          if (cmd.length >= 3 && cmd[2] == "-a") {
+            ddb_push_prefix("   ");
+            ddb_disasm_bytes(graph[addr][0], addr);
+            ddb_msg("");
+            ddb_pop_prefix();
+          }
+        }
+      } else {
+        ddb_log("no such function: " ~ cmd[1], false);
+      }
+      break;
     case "b":
     case "break":
       if (cmd.length != 2) {
@@ -158,7 +293,11 @@ bool ddb_eval(string[] cmd) {
         ddb_log("<Usage>: disasm func", false);
         break;
       }
-      ddb_disasm_function(cmd[1]);
+      if (auto func = cmd[1] in elf.functions()) {
+        ddb_disasm_bytes(func.opbytes, func.addr);
+      } else {
+        ddb_log("no such function: " ~ cmd[1], false);
+      }
       break;
 
     case "s":
@@ -262,10 +401,16 @@ void main(string[] args)
     } else {
       auto cont = true;
       while (cont) {
-        messages.length = 0;
+        Tuple!(string[], string) cmd;
+        try {
+          cmd = ddb_read();
+          cont = ddb_eval(cmd[0]);
+        } catch(DDBException e) {
+          writeln("[-]"~e.toString());
+          messages.length = 0;
+          continue;
+        }
 
-        auto cmd = ddb_read();
-        cont = ddb_eval(cmd[0]);
         if (cmd[1].length > 0) {
           auto tmp = File("/tmp/ddb.tmp", "w");
           tmp.writeln(messages.join("\n"));
@@ -276,6 +421,7 @@ void main(string[] args)
         } else {
           writeln(messages.join("\n"));
         }
+        messages.length = 0;
       }
     }
   }
