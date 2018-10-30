@@ -60,17 +60,10 @@ class DDB {
         CmdEntry(["fls", "funcs", "functions"], "list function symbols", &cmdFunctions),
         CmdEntry(["d", "dis", "disasm"], "disassemble function", &cmdDisasm),
         CmdEntry(["g", "gengraph"], "generate jumpgraph", &cmdGengraph),
+        CmdEntry(["a", "analy"], "analyze jumpgraph", &cmdAnalyze),
         CmdEntry(["h", "?", "help"], "show help", &cmdHelp),
         CmdEntry(["exit"], "exit debugger", (string[] args) { this.exit(); return true; }),
       ];
-    }
-
-    ulong parseAddr(string addrstr) {
-      if (addrstr.startsWith("0x") || addrstr.startsWith("0X")) {
-        return addrstr[2..$].to!ulong(16);
-      }
-
-      throw new Exception("unimplemented");
     }
 
     void exit() {
@@ -209,10 +202,10 @@ class DDB {
         return true;
       }
 
-      if (auto func = args[1] in this.funcs) {
+      if (auto func = args[0] in this.funcs) {
         disasmBytes(func.opbytes, func.addr);
       } else {
-        this.log("no such function: " ~ args[1], false);
+        this.log("no such function: " ~ args[0], false);
       }
       return true;
     }
@@ -243,8 +236,10 @@ class DDB {
       // (bytes, jumpto)[addr]
       auto graph = makeJumpgraph(this.funcs[fname], this.cs);
       foreach (addr; graph.keys.sort) {
-        // addr: [jumpto1,  jumpto2, ...]
-        string heading = "0x%x:[%s]".format(addr, graph[addr].jumpto.map!(x => "0x%x".format(x)).array.join(", "));
+        // addr: [{jumpto1,  jumpto2, ...}, {jumpfrom1, jumpfrom2, ...}]
+        string jumpto = "{%s}".format(graph[addr].jumpto.map!(x => "0x%x".format(x)).join(", "));
+        string jumpfrom = "{%s}".format(graph[addr].jumpfrom.map!(x => "0x%x".format(x)).join(", "));
+        string heading = "0x%x:[%s, %s]".format(addr, jumpto, jumpfrom);
         this.msg(cast(string)heading);
         
         // if -a is specified, show disassemble of block
@@ -255,6 +250,37 @@ class DDB {
           popPrefix();
         }
       }
+      return true;
+    }
+
+    // main work
+    bool cmdAnalyze(string[] args) {
+      if (args.length < 1) {
+        this.log("<Usage>: banalyze func <break points>", false);
+        return true;
+      }
+      auto fname = args[0];
+      if (fname !in this.funcs) {
+        this.log("no such function: " ~ fname, false);
+        return true;
+      }
+
+      // (bytes, jumpto)[addr]
+      auto graph = makeJumpgraph(this.funcs[fname], this.cs);
+
+      ulong[] bps;
+      foreach (a; args[1..$]) {
+        bps ~= parseAddr(a);
+      }
+
+
+      // analyzing graph
+      auto agraph = graphAnalyze(graph, this.funcs[fname].addr, bps);
+      foreach (addr; agraph.keys.sort) {
+        string heading = "0x%x: %s".format(addr, agraph[addr].covers.map!(to!string).join(", "));
+        this.msg(heading);
+      }
+
       return true;
     }
 
@@ -348,15 +374,25 @@ class DDB {
       }
     }
 }
+ulong parseAddr(string addrstr) {
+  if (addrstr.startsWith("0x") || addrstr.startsWith("0X")) {
+    return addrstr[2..$].to!ulong(16);
+  }
+
+  throw new Exception("unimplemented");
+}
+string toAddr(ulong addr) {
+  return "0x" ~ addr.to!string(16);
+}
+
 
 DDB ddb = null;
 
+alias AsmBlock = Tuple!(ubyte[], "opbytes", ulong[], "jumpto", ulong[], "jumpfrom");
 
-alias AsmBlock = Tuple!(ubyte[], "opbytes", ulong[], "jumpto");
-alias AsmBlocks = AsmBlock[ulong];
-
-AsmBlocks makeJumpgraph(debugger.Function f, Capstone cs) {
-  AsmBlocks blocks;
+AsmBlock[ulong] makeJumpgraph(debugger.Function f, Capstone cs) {
+  AsmBlock[ulong] blocks;
+  ulong[][ulong] jumpfroms;
 
   const auto start_addr = f.addr;
   const auto end_addr = f.addr + f.opbytes.length;
@@ -383,7 +419,13 @@ AsmBlocks makeJumpgraph(debugger.Function f, Capstone cs) {
           if (!(start_addr <= target && target <= end_addr)) {
             throw new DDBException("unsupported jump target");
           }
-          blocks[irs[start_i].addr] = AsmBlock(f.opbytes[offsetof[start_i]..offsetof[i] + irs[i].bytes.length], [target]);
+          blocks[irs[start_i].addr] = AsmBlock(f.opbytes[offsetof[start_i]..offsetof[i] + irs[i].bytes.length], [target], []);
+          if (target in jumpfroms) {
+            jumpfroms[target] ~= irs[start_i].addr;
+          } else {
+            jumpfroms[target] = [irs[start_i].addr];
+          }
+
           if (target !in blocks) {
             loopf(addr_to_index[target]);
           }
@@ -403,7 +445,18 @@ AsmBlocks makeJumpgraph(debugger.Function f, Capstone cs) {
             throw new DDBException("unsupported jump target");
           }
 
-          blocks[irs[start_i].addr] = AsmBlock(f.opbytes[offsetof[start_i]..offsetof[i] + irs[i].bytes.length], [target1, target2]);
+          blocks[irs[start_i].addr] = AsmBlock(f.opbytes[offsetof[start_i]..offsetof[i] + irs[i].bytes.length], [target1, target2], []);
+          if (target1 in jumpfroms) {
+            jumpfroms[target1] ~= irs[start_i].addr;
+          } else {
+            jumpfroms[target1] = [irs[start_i].addr];
+          }
+          if (target2 in jumpfroms) {
+            jumpfroms[target2] ~= irs[start_i].addr;
+          } else {
+            jumpfroms[target2] = [irs[start_i].addr];
+          }
+
           if (target1 !in blocks) {
             loopf(addr_to_index[target1]);
           }
@@ -416,14 +469,105 @@ AsmBlocks makeJumpgraph(debugger.Function f, Capstone cs) {
       }
     }
     if (i == irs.length) {
-      blocks[irs[start_i].addr] = AsmBlock(f.opbytes[offsetof[start_i]..offsetof[i-1] + irs[i-1].bytes.length], cast(ulong[])[]);
+      blocks[irs[start_i].addr] = AsmBlock(f.opbytes[offsetof[start_i]..offsetof[i-1] + irs[i-1].bytes.length], cast(ulong[])[], []);
     }
   };
   loopf(0);
 
+  foreach (k; blocks.keys) {
+    if (k in jumpfroms) {
+      blocks[k].jumpfrom = jumpfroms[k];
+    }
+  }
+
   return blocks;
 }
 
+
+alias MarkedBlock = Tuple!(ubyte[], "opbytes", ulong[], "jumpto", ulong[], "jumpfrom", int[], "covers");
+alias JumpEdge = Tuple!(ulong, "jumpfrom", ulong, "jumpto");
+MarkedBlock[ulong] graphAnalyze(AsmBlock[ulong] graph, ulong entry, ulong[] breakpoints) {
+  ulong[] blocks = []; // breakpoint を設定することになるブロックの開始アドレス
+  foreach (p; breakpoints) {
+    foreach (s, node; graph) {
+      if (s <= p && p < s + node.opbytes.length) {
+        blocks ~= s;
+      }
+    }
+  }
+  writeln(blocks.map!(toAddr).join(", "));
+
+  int numcount = 0;
+  int[JumpEdge] edges;
+  ulong[] graph_stack = [];
+  foreach (b; blocks) {
+    foreach (from; graph[b].jumpfrom) {
+      graph_stack ~= from;
+      auto edge = JumpEdge(from, b);
+      edges[edge] = numcount;
+      numcount++;
+    }
+  }
+  foreach (edge, num; edges) {
+    writefln("%d: 0x%x to 0x%x", num, edge.jumpfrom, edge.jumpto);
+  }
+
+  // breakしたいpointへの経路に番号を振る
+  while (graph_stack.length != 0) {
+    auto b = graph_stack[0];
+    graph_stack.popFrontN(1);
+
+    auto froms = graph[b].jumpfrom;
+    if (froms.length > 1) {
+      foreach (from; froms) {
+        auto edge = JumpEdge(from, b);
+        if (edge in edges) {
+          continue;
+        }
+
+        edges[edge] = numcount;
+        graph_stack ~= from;
+        numcount++;
+      }
+    }
+  }
+
+
+  JumpEdge[] used_edges;
+  MarkedBlock[ulong] marked_blocks;
+
+  // 各ブロックにBreakPointを仕掛けた場合のカバー範囲を探索
+  int[] delegate(ulong) loopf;
+  loopf = (ulong addr) {
+    int[] ret;  // このブロックがカバーするNumberedなEdgeのリスト
+    foreach (to; graph[addr].jumpto) {
+      // 未訪問のEdgeのみを探索する
+      auto edge = JumpEdge(addr, to);
+      if (used_edges.canFind(edge)) {
+        continue;
+      }
+      used_edges ~= edge;
+
+      ret ~= loopf(to);
+      // このブロックから伸びてる numbered edge を入れる
+      if (edge in edges) {
+        ret ~= edges[edge];
+      }
+    }
+
+    if (addr !in marked_blocks) {
+      marked_blocks[addr] = MarkedBlock(graph[addr].opbytes, graph[addr].jumpto, graph[addr].jumpfrom, []);
+    }
+    marked_blocks[addr].covers = (marked_blocks[addr].covers ~ ret).sort.uniq.array;
+
+    return marked_blocks[addr].covers;
+  };
+  
+  // 全ブロックにブレークポイントを仕掛けてみる
+  loopf(entry);
+
+  return marked_blocks;
+}
 
 
 auto execTarget(string[] args) {
