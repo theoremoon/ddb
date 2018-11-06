@@ -8,8 +8,6 @@
 	"license": "MIT",
   "dependencies": {
     "editline-d": "~>0.0.1",
-    "dapstone": {
-      "path": "../code/d/dapstone"
-    }
+    "dapstone": "~>0.0.1"
   }
 }

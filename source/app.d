@@ -272,15 +272,6 @@ class DDB {
       foreach (a; args[1..$]) {
         bps ~= parseAddr(a);
       }
-
-
-      // analyzing graph
-      auto agraph = graphAnalyze(graph, this.funcs[fname].addr, bps);
-      foreach (addr; agraph.keys.sort) {
-        string heading = "0x%x: %s".format(addr, agraph[addr].covers.map!(to!string).join(", "));
-        this.msg(heading);
-      }
-
       return true;
     }
 
@@ -484,89 +475,57 @@ AsmBlock[ulong] makeJumpgraph(debugger.Function f, Capstone cs) {
 }
 
 
-alias MarkedBlock = Tuple!(ubyte[], "opbytes", ulong[], "jumpto", ulong[], "jumpfrom", int[], "covers");
 alias JumpEdge = Tuple!(ulong, "jumpfrom", ulong, "jumpto");
-MarkedBlock[ulong] graphAnalyze(AsmBlock[ulong] graph, ulong entry, ulong[] breakpoints) {
+ulong[][][ulong] graphAnalyze(AsmBlock[ulong] graph, ulong entry, ulong[] breakpoints) {
   ulong[] blocks = []; // breakpoint を設定することになるブロックの開始アドレス
   foreach (p; breakpoints) {
     foreach (s, node; graph) {
-      if (s <= p && p < s + node.opbytes.length) {
+      if (s <= p && p <= s + node.opbytes.length) {
         blocks ~= s;
       }
     }
   }
   writeln(blocks.map!(toAddr).join(", "));
 
-  int numcount = 0;
-  int[JumpEdge] edges;
-  ulong[] graph_stack = [];
-  foreach (b; blocks) {
-    foreach (from; graph[b].jumpfrom) {
-      graph_stack ~= from;
-      auto edge = JumpEdge(from, b);
-      edges[edge] = numcount;
-      numcount++;
-    }
-  }
-  foreach (edge, num; edges) {
-    writefln("%d: 0x%x to 0x%x", num, edge.jumpfrom, edge.jumpto);
-  }
+  /// IDEA: Node 毎に持たずとも root からの全経路みたいなのを持っておけばよいのでは？？
+  ulong[][][ulong] roots;  // 経路のリスト（をNode毎にもつ）
+  int[JumpEdge] used;
 
-  // breakしたいpointへの経路に番号を振る
-  while (graph_stack.length != 0) {
-    auto b = graph_stack[0];
-    graph_stack.popFrontN(1);
-
-    auto froms = graph[b].jumpfrom;
-    if (froms.length > 1) {
-      foreach (from; froms) {
-        auto edge = JumpEdge(from, b);
-        if (edge in edges) {
-          continue;
-        }
-
-        edges[edge] = numcount;
-        graph_stack ~= from;
-        numcount++;
-      }
-    }
-  }
-
-
-  JumpEdge[] used_edges;
-  MarkedBlock[ulong] marked_blocks;
-
-  // 各ブロックにBreakPointを仕掛けた場合のカバー範囲を探索
-  int[] delegate(ulong) loopf;
+  
+  // 経路全探索する
+  ulong[][] delegate(ulong) loopf;
   loopf = (ulong addr) {
-    int[] ret;  // このブロックがカバーするNumberedなEdgeのリスト
+    stderr.writefln("0x%x", addr);
+    if (addr in roots) {
+      return roots[addr];
+    }
+    ulong[][] node_roots = [];  // このNode からたどる経路
+
+    // このNodeから伸びている先
     foreach (to; graph[addr].jumpto) {
-      // 未訪問のEdgeのみを探索する
       auto edge = JumpEdge(addr, to);
-      if (used_edges.canFind(edge)) {
+      if (edge in used) {
+        node_roots ~= [to];
         continue;
       }
-      used_edges ~= edge;
+      used[edge] = 0;
 
-      ret ~= loopf(to);
-      // このブロックから伸びてる numbered edge を入れる
-      if (edge in edges) {
-        ret ~= edges[edge];
+      auto to_roots =  loopf(to);  // 伸びている先の伸びている先……と辿った経路
+      if (to_roots.length > 0) {
+        foreach (r; to_roots) {
+          node_roots ~= (to ~ r);  // 伸びた先も追加しておいて……ということ
+        }
+      } else {
+        node_roots ~= [to];  // 先が行き止まりだったらこう
       }
     }
 
-    if (addr !in marked_blocks) {
-      marked_blocks[addr] = MarkedBlock(graph[addr].opbytes, graph[addr].jumpto, graph[addr].jumpfrom, []);
-    }
-    marked_blocks[addr].covers = (marked_blocks[addr].covers ~ ret).sort.uniq.array;
-
-    return marked_blocks[addr].covers;
+    return roots[addr] = node_roots;
   };
-  
-  // 全ブロックにブレークポイントを仕掛けてみる
   loopf(entry);
+  stderr.writeln("AIUEO");
 
-  return marked_blocks;
+  return roots;
 }
 
 
@@ -595,6 +554,28 @@ string formatOpbytes(ubyte[] bytes) {
 
 void main(string[] args)
 {
+
+  AsmBlock[ulong] graph;
+  graph[1] = AsmBlock([], [2], []);
+  graph[2] = AsmBlock([], [3, 4], [1, 8]);
+  graph[3] = AsmBlock([], [4, 5], [2, 4, 5]);
+  graph[4] = AsmBlock([], [6, 3], [2, 3]);
+  graph[5] = AsmBlock([], [6], [3]);
+  graph[6] = AsmBlock([], [7, 8], [5, 4]);
+  graph[7] = AsmBlock([], [], [6]);
+  graph[8] = AsmBlock([], [2], [6]);
+
+  auto agraph = graphAnalyze(graph, 1, [6]);
+  foreach (addr; agraph.keys.sort) {
+    writefln("0x%x", addr);
+    foreach (r; agraph[addr]) {
+      write("\t");
+      writeln(r.map!(toAddr).join("->"));
+    }
+    writeln();
+  }
+
+  /*
   if (args.length == 1) {
     writefln("<Usage>%s <target>", args[0]);
     return;
@@ -608,4 +589,5 @@ void main(string[] args)
     }
     ddb.cmdRepl();
   }
+  */
 }
