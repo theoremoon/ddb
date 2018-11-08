@@ -475,17 +475,7 @@ AsmBlock[ulong] makeJumpgraph(debugger.Function f, Capstone cs) {
 }
 
 
-alias JumpEdge = Tuple!(ulong, "jumpfrom", ulong, "jumpto");
-auto graphAnalyze(AsmBlock[ulong] graph, ulong entry, ulong[] breakpoints) {
-  ulong[] blocks = []; // breakpoint を設定することになるブロックの開始アドレス
-  foreach (p; breakpoints) {
-    foreach (s, node; graph) {
-      if (s <= p && p <= s + node.opbytes.length) {
-        blocks ~= s;
-      }
-    }
-  }
-
+auto getRoots(AsmBlock[ulong] graph, ulong entry) {
   /// IDEA: Node 毎に持たずとも root からの全経路みたいなのを持っておけばよいのでは？？
   ///  ↑いまの探索でも自然にそうなる
   ulong[][][ulong] roots;  // 経路のリスト（をNode毎にもつ）
@@ -557,37 +547,35 @@ string formatOpbytes(ubyte[] bytes) {
 
 void main(string[] args)
 {
+  if (args.length == 1) {
+    writefln("<Usage>%s <target>", args[0]);
+    return;
+  }
 
-  AsmBlock[ulong] graph;
-  graph[1] = AsmBlock([], [2], []);
-  graph[2] = AsmBlock([], [3, 4], [1, 8]);
-  graph[3] = AsmBlock([], [4, 5], [2, 4, 5]);
-  graph[4] = AsmBlock([], [6, 3], [2, 3]);
-  graph[5] = AsmBlock([], [6], [3]);
-  graph[6] = AsmBlock([], [7, 8], [5, 4]);
-  graph[7] = AsmBlock([], [], [6]);
-  graph[8] = AsmBlock([], [2], [6]);
+  auto elf = readELF(args[1]);
+  Capstone cs;
+  auto funcs = elf.functions();
 
-  auto roots = graphAnalyze(graph, 1, [6]);
+  if (cast(ELF32)(elf) !is null) {
+    cs = new Capstone(cs_arch.CS_ARCH_X86, cs_mode.CS_MODE_32);
+  } else if (cast(ELF64)(elf) !is null) {
+    cs = new Capstone(cs_arch.CS_ARCH_X86, cs_mode.CS_MODE_64);
+  }
+  auto graph = makeJumpgraph(funcs["scramble"], cs);
+
+  foreach (addr; graph.keys.sort) {
+    // addr: [{jumpto1,  jumpto2, ...}, {jumpfrom1, jumpfrom2, ...}]
+    string jumpto = "{%s}".format(graph[addr].jumpto.map!(x => "0x%x".format(x)).join(", "));
+    string jumpfrom = "{%s}".format(graph[addr].jumpfrom.map!(x => "0x%x".format(x)).join(", "));
+    string heading = "0x%x:[%s, %s]".format(addr, jumpto, jumpfrom);
+    writeln(heading);
+  }
+  
+  auto roots = getRoots(graph, funcs["scramble"].addr);
   writeln("roots:");
   foreach (r; roots) {
     write("\t");
     writeln(r.map!(toAddr).join("->"));
   }
-
-  /*
-  if (args.length == 1) {
-    writefln("<Usage>%s <target>", args[0]);
-    return;
-  }
   
-  // ELF を解析
-  ddb = new DDB(args[1]);
-  while (true) {
-    if (ddb.target_running) {
-      ddb.wait();
-    }
-    ddb.cmdRepl();
-  }
-  */
 }
