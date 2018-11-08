@@ -476,7 +476,7 @@ AsmBlock[ulong] makeJumpgraph(debugger.Function f, Capstone cs) {
 
 
 alias JumpEdge = Tuple!(ulong, "jumpfrom", ulong, "jumpto");
-ulong[][][ulong] graphAnalyze(AsmBlock[ulong] graph, ulong entry, ulong[] breakpoints) {
+auto graphAnalyze(AsmBlock[ulong] graph, ulong entry, ulong[] breakpoints) {
   ulong[] blocks = []; // breakpoint を設定することになるブロックの開始アドレス
   foreach (p; breakpoints) {
     foreach (s, node; graph) {
@@ -485,32 +485,35 @@ ulong[][][ulong] graphAnalyze(AsmBlock[ulong] graph, ulong entry, ulong[] breakp
       }
     }
   }
-  writeln(blocks.map!(toAddr).join(", "));
 
   /// IDEA: Node 毎に持たずとも root からの全経路みたいなのを持っておけばよいのでは？？
+  ///  ↑いまの探索でも自然にそうなる
   ulong[][][ulong] roots;  // 経路のリスト（をNode毎にもつ）
-  int[JumpEdge] used;
-
+  int [ulong][ulong] loop_nodes;  // from, to の間に loop があることを示す（無向
+  ulong[] exploring;  // 探索中であることを表すリスト
   
-  // 経路全探索する
+  // 経路のリストを返す
   ulong[][] delegate(ulong) loopf;
+
+  // 経路全探索する
   loopf = (ulong addr) {
-    stderr.writefln("0x%x", addr);
+    // メモがあれば使う
     if (addr in roots) {
       return roots[addr];
     }
+
+    exploring ~= addr; // このNodeを含む経路をたどっていることを示しておく
     ulong[][] node_roots = [];  // このNode からたどる経路
 
     // このNodeから伸びている先
     foreach (to; graph[addr].jumpto) {
-      auto edge = JumpEdge(addr, to);
-      if (edge in used) {
-        node_roots ~= [to];
+      // 探索中ならループするという情報だけを入れておく
+      if (exploring.canFind(to)) {
+        loop_nodes[addr][to] = 1;
         continue;
       }
-      used[edge] = 0;
 
-      auto to_roots =  loopf(to);  // 伸びている先の伸びている先……と辿った経路
+      auto to_roots = loopf(to);  // 伸びている先の伸びている先……と辿った経路
       if (to_roots.length > 0) {
         foreach (r; to_roots) {
           node_roots ~= (to ~ r);  // 伸びた先も追加しておいて……ということ
@@ -520,12 +523,12 @@ ulong[][][ulong] graphAnalyze(AsmBlock[ulong] graph, ulong entry, ulong[] breakp
       }
     }
 
+    exploring.popBack();  // たどり終えた
     return roots[addr] = node_roots;
   };
   loopf(entry);
-  stderr.writeln("AIUEO");
 
-  return roots;
+  return roots[entry];
 }
 
 
@@ -565,14 +568,11 @@ void main(string[] args)
   graph[7] = AsmBlock([], [], [6]);
   graph[8] = AsmBlock([], [2], [6]);
 
-  auto agraph = graphAnalyze(graph, 1, [6]);
-  foreach (addr; agraph.keys.sort) {
-    writefln("0x%x", addr);
-    foreach (r; agraph[addr]) {
-      write("\t");
-      writeln(r.map!(toAddr).join("->"));
-    }
-    writeln();
+  auto roots = graphAnalyze(graph, 1, [6]);
+  writeln("roots:");
+  foreach (r; roots) {
+    write("\t");
+    writeln(r.map!(toAddr).join("->"));
   }
 
   /*
