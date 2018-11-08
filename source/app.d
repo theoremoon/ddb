@@ -545,6 +545,15 @@ string formatOpbytes(ubyte[] bytes) {
   return buf.join(" ");
 }
 
+long linearSearch(E)(E[] range, E element) {
+  foreach (i, e; range) {
+    if (element == e) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 void main(string[] args)
 {
   if (args.length == 1) {
@@ -561,21 +570,48 @@ void main(string[] args)
   } else if (cast(ELF64)(elf) !is null) {
     cs = new Capstone(cs_arch.CS_ARCH_X86, cs_mode.CS_MODE_64);
   }
-  auto graph = makeJumpgraph(funcs["scramble"], cs);
+  // グラフを作る
+  auto graph = makeJumpgraph(funcs["yosh"], cs);
 
-  foreach (addr; graph.keys.sort) {
-    // addr: [{jumpto1,  jumpto2, ...}, {jumpfrom1, jumpfrom2, ...}]
-    string jumpto = "{%s}".format(graph[addr].jumpto.map!(x => "0x%x".format(x)).join(", "));
-    string jumpfrom = "{%s}".format(graph[addr].jumpfrom.map!(x => "0x%x".format(x)).join(", "));
-    string heading = "0x%x:[%s, %s]".format(addr, jumpto, jumpfrom);
-    writeln(heading);
-  }
-  
-  auto roots = getRoots(graph, funcs["scramble"].addr);
+  // 経路を取る
+  auto roots = getRoots(graph, funcs["yosh"].addr);
   writeln("roots:");
   foreach (r; roots) {
     write("\t");
     writeln(r.map!(toAddr).join("->"));
   }
+
+
+  // ブレークポイントを仕掛けたい点(key)と、その点でBreakするためにはここに仕掛けるとよい、という点 value
+  ulong[][ulong] bp_a;  // candidates の代わり。師匠直伝
+
+  // ブレークポイントをN箇所に仕掛ける
+  foreach (a; args[2..$]) {
+    ulong[][] addr_roots = [];
+    auto addr  = parseAddr(a);
+
+    foreach (i, r; roots) {
+      auto u = r.linearSearch(addr);
+      if (u != -1) {  // アドレスAを含む
+        addr_roots ~= r[0..u+1];
+      }
+    }
+
+    if (addr_roots.length == 0) {
+      continue;
+    }
+
+    // 複数の経路で共通のNodeを探す
+    // なければそこにはBPしかけなくていい
+    ulong[] intersects = addr_roots[0];
+    foreach (i; 1..addr_roots.length) {
+      intersects = setIntersection(intersects, addr_roots[i]).array;
+    }
+
+    bp_a[addr] = intersects;
+  }
   
+  foreach (k; bp_a.keys) {
+    writeln(k.toAddr(), ": ", bp_a[k].map!(toAddr).join(","));
+  }
 }
