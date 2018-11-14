@@ -610,8 +610,26 @@ void main(string[] args)
 
     bp_a[addr] = intersects;
   }
+
+  ulong[][ulong]  rev_bp_a;  /// bp_a の逆。BreakPointの候補点がKeyになっている
+  foreach (v, ks; bp_a) {
+    foreach (k; ks) {
+      if (k !in rev_bp_a) {
+        rev_bp_a[k] = [];
+      }
+      rev_bp_a[k] ~= v;
+    }
+  }
+
+  // WIP
+  const int B_REG_NUM = 2;  /// HW BP Register の数
+
   
   foreach (k; bp_a.keys) {
     writeln(k.toAddr(), ": ", bp_a[k].map!(toAddr).join(","));
+  }
+
+  foreach (k; rev_bp_a.keys) {
+    writeln(k.toAddr(), ": ", rev_bp_a[k].map!(toAddr).join(","));
   }
 }
