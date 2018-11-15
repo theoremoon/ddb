@@ -491,10 +491,36 @@ auto getRoots(AsmBlock[ulong] graph, ulong entry) {
     if (addr in roots) {
       return roots[addr];
     }
-
     exploring ~= addr; // このNodeを含む経路をたどっていることを示しておく
-    ulong[][] node_roots = [];  // このNode からたどる経路
 
+    /*
+    == 省略される点にBreakPointを仕掛ける場合に、その点がなくなってしまうので死ぬ。それが治ったらこれをコメントインして ==
+    // 1個しかジャンプ先がない場合はそちらに処理を任せてこちらの情報は保存しない（男らしい）
+    if (graph[addr].jumpto.length == 1) {
+      auto to = graph[addr].jumpto[0];
+
+      // 探索中ならループするという情報だけを入れておく
+      if (exploring.canFind(to)) {
+        loop_nodes[addr][to] = 1;
+        exploring.popBack(); 
+        ulong[][] dummy;  // ここからの経路はないのでこうする
+        return dummy;
+      }
+
+      auto r = loopf(to);
+
+      // entryが存在しないとあとで死ぬ
+      if (addr == entry) {
+        roots[entry] = r;
+      }
+
+      exploring.popBack();  // たどり終えた
+      return r;
+    }
+    */
+
+
+    ulong[][] node_roots = [];  // このNode からたどる経路
     // このNodeから伸びている先
     foreach (to; graph[addr].jumpto) {
       // 探索中ならループするという情報だけを入れておく
@@ -504,12 +530,12 @@ auto getRoots(AsmBlock[ulong] graph, ulong entry) {
       }
 
       auto to_roots = loopf(to);  // 伸びている先の伸びている先……と辿った経路
-      if (to_roots.length > 0) {
+      if (to_roots.length == 0) {
+        node_roots ~= [to];  // 先が行き止まりだったらこう
+      } else {
         foreach (r; to_roots) {
           node_roots ~= (to ~ r);  // 伸びた先も追加しておいて……ということ
         }
-      } else {
-        node_roots ~= [to];  // 先が行き止まりだったらこう
       }
     }
 
@@ -554,10 +580,67 @@ long linearSearch(E)(E[] range, E element) {
   return -1;
 }
 
+
+/// return true if x including all bits of y 
+bool binaryIncluding(ulong x, ulong y) {
+  return ((~x)&y) == 0;
+}
+
+/// Make Hasse Diagram
+/// O(N^3)
+/// return ulong to[ulong from] 
+auto makeHasseDiagram(ulong[] xs) {
+  auto rel = new int[][](xs.length, xs.length);
+  ulong[][ulong] rel2; // key: from, values: to
+  
+  /// make graph
+  foreach (i; 0..xs.length) {
+    foreach (j; (i+1)..xs.length) {
+      if (xs[i] == xs[j]) {
+        continue;
+      }
+
+      /// if xs[i] includeing xs[j] then j < i
+      if (xs[i].binaryIncluding(xs[j])) {
+        rel[j][i] = 1;
+        if (j !in rel2) {
+          rel2[j] = [];
+        }
+        rel2[j] ~= i;
+      }
+      if (xs[j].binaryIncluding(xs[i])) {
+        rel[i][j] = 1;
+        if (i !in rel2) {
+          rel2[i] = [];
+        }
+        rel2[i] ~= j;
+      }
+    }
+  }
+
+  ulong[][ulong] rel3;  // key: from, value: to
+  /// transitive reduction
+  foreach (from, tos; rel2) {
+    ulong[] excludes = [];
+    foreach (i, x; tos) {
+      foreach (j, y; tos) {
+        // if x < y then y is not required
+        if (rel[x][y] == 1) {
+          excludes ~= y;
+        }
+      }
+    }
+    rel3[from] = tos.filter!(x => !excludes.canFind(x)).array;
+  }
+
+  return rel3;
+}
+
+
 void main(string[] args)
 {
-  if (args.length == 1) {
-    writefln("<Usage>%s <target>", args[0]);
+  if (args.length < 4) {
+    writefln("<Usage>%s <target> <funcname> <numof_bpreg> <breakpoints>", args[0]);
     return;
   }
 
@@ -570,11 +653,15 @@ void main(string[] args)
   } else if (cast(ELF64)(elf) !is null) {
     cs = new Capstone(cs_arch.CS_ARCH_X86, cs_mode.CS_MODE_64);
   }
+  auto funcname = args[2];
+  auto numof_bpreg = args[3].to!int;
+  auto bps = args[4..$].map!(parseAddr).array;
+
   // グラフを作る
-  auto graph = makeJumpgraph(funcs["yosh"], cs);
+  auto graph = makeJumpgraph(funcs[funcname], cs);
 
   // 経路を取る
-  auto roots = getRoots(graph, funcs["yosh"].addr);
+  auto roots = getRoots(graph, funcs[funcname].addr);
   writeln("roots:");
   foreach (r; roots) {
     write("\t");
@@ -583,12 +670,9 @@ void main(string[] args)
 
 
   // ブレークポイントを仕掛けたい点(key)と、その点でBreakするためにはここに仕掛けるとよい、という点 value
-  ulong[][ulong] bp_a;  // candidates の代わり。師匠直伝
-
-  // ブレークポイントをN箇所に仕掛ける
-  foreach (a; args[2..$]) {
+  ulong[][ulong] bp_a; 
+  foreach (addr; bps) {
     ulong[][] addr_roots = [];
-    auto addr  = parseAddr(a);
 
     foreach (i, r; roots) {
       auto u = r.linearSearch(addr);
@@ -621,15 +705,41 @@ void main(string[] args)
     }
   }
 
-  // WIP
-  const int B_REG_NUM = 2;  /// HW BP Register の数
+  // ブレークポイントの候補点を並べて2進変換
+  const DUMMY_ADDR = ulong.max;
+  ulong[] bp_binvalues = [0];
+  ulong[] bp_keys = [DUMMY_ADDR];
+  foreach (k, v; rev_bp_a) {
+    ulong x = 0;
+    foreach(i, bp; bps) {
+      if (v.canFind(bp)) {
+        x |= 1 << i;
+      }
+    }
+    bp_keys ~= k;
+    bp_binvalues ~= x;
+  }
 
-  
+
+  writeln("\nWanna BreakPoint to Break Candidates");
   foreach (k; bp_a.keys) {
-    writeln(k.toAddr(), ": ", bp_a[k].map!(toAddr).join(","));
+    writeln("\t", k.toAddr(), ": ", bp_a[k].map!(toAddr).join(","));
   }
 
+  writeln("\nBreak Candidates to Wanna BreakPoint");
   foreach (k; rev_bp_a.keys) {
-    writeln(k.toAddr(), ": ", rev_bp_a[k].map!(toAddr).join(","));
+    writeln("\t", k.toAddr(), ": ", rev_bp_a[k].map!(toAddr).join(","));
   }
+
+  writeln("\nBinary form of Break Candidates");
+  foreach (i, k; bp_keys) {
+    writefln("\t%s: %08b".format(k.toAddr(), bp_binvalues[i]));
+  }
+
+  auto hassemap = makeHasseDiagram(bp_binvalues);
+  writeln("\nOrder of Break Candidates");
+  foreach (from, tos; hassemap) {
+    writefln("\t%s -> %s".format(bp_keys[from].toAddr, tos.map!(x => bp_keys[x].toAddr).array.join(", ")));
+  }
+
 }
