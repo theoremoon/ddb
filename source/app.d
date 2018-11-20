@@ -1,6 +1,8 @@
 import std.stdio;
 import core.sys.posix.unistd;
 import std.process;
+import std.file;
+import std.path;
 import std.string;
 import std.typecons;
 import std.conv;
@@ -30,8 +32,9 @@ class DDB {
     ELF elf = null;
     debugger.Function[string] funcs;
     bool target_running = false;
-    bool first_break = true;
+    bool first_break = false;
     pid_t pid = 0;
+    ulong load_addr;
     ulong[] break_addrs = [];
     ubyte[] regs = [];
 
@@ -60,7 +63,6 @@ class DDB {
         CmdEntry(["fls", "funcs", "functions"], "list function symbols", &cmdFunctions),
         CmdEntry(["d", "dis", "disasm"], "disassemble function", &cmdDisasm),
         CmdEntry(["g", "gengraph"], "generate jumpgraph", &cmdGengraph),
-        CmdEntry(["a", "analy"], "analyze jumpgraph", &cmdAnalyze),
         CmdEntry(["h", "?", "help"], "show help", &cmdHelp),
         CmdEntry(["exit"], "exit debugger", (string[] args) { this.exit(); return true; }),
       ];
@@ -91,7 +93,6 @@ class DDB {
       stdout.flush();
     }
 
-
     void wait() {
       // wait break
       int status;
@@ -100,28 +101,31 @@ class DDB {
         target_running = false;
       }
 
-      // set hardware breakpoint when execve
-      if (target_running && first_break) {
-        first_break = false;
-        foreach (i, addr; break_addrs) {
-          if (! set_hw_breakpoint_to(pid, addr, cast(int)i)) {
-            throw new Exception("[-]Failed to Set Haredware Breakpoint");
-          }
-        }
-        ptrace(PTRACE_CONT, pid, null, null);
-
-        return this.wait();
-      } 
 
       // get register
-      if (target_running && !first_break) {
+      if (target_running) {
         regs.length = 256;
         if (ptrace(PTRACE_GETREGS, pid, null, regs.ptr) != 0) {
           throw new Exception("[-]failed to get regsiter");
         }
 
-        auto eip = elf.registerOf(regs, "eip");
+        auto eip = elf.registerOf(regs, (elf.bitLength == 64) ? "rip" : "eip");
         this.log("break at 0x%x".format(eip));
+
+
+        if (first_break) {
+          first_break = false;
+
+          // parse /proc/pid/maps and get real effective entry point address
+          auto elf_abspath = absolutePath(this.elf_name, getcwd());
+          auto maplines = readText("/proc/%d/maps".format(pid)).split("\n");
+          auto elf_sections = maplines.filter!(line => line.canFind(elf_abspath));
+          auto text_section = elf_sections.filter!(line => line.split(" ")[1].canFind('x')).array;
+          if (text_section.length == 0) {
+            throw new Exception("Failed to parse /prof/pid/maps"); 
+          }
+          this.load_addr = text_section[0].until("-").to!(string).to!(ulong)(16);
+        }
       }
     }
 
@@ -139,6 +143,49 @@ class DDB {
       break_addrs ~= addr;
       this.log("set hardware breakpoint at 0x%x".format(addr));
     }
+
+    ubyte[] getCodes(long addr, ulong len) {
+      import std.bitmanip;
+      import std.system : Endian;
+
+
+      auto addr2 = addr;
+      auto cnt = 0;
+      ubyte[] codes = [];
+
+      while (cnt < len) {
+        // peek machine code 4 or 8 bytes
+        auto code = ptrace(PTRACE_PEEKDATA, pid, cast(void*)addr, null);
+        addr += elf.bitLength / 8;
+        cnt += elf.bitLength / 8;
+
+        // convert returned machine codes (long) to ubyte[]
+        ubyte[] buf = new ubyte[]( code.sizeof );
+        std.bitmanip.write!(typeof(code), Endian.littleEndian)(buf, code, 0);
+        codes ~= buf;
+      }
+
+      return codes;
+    }
+
+    bool printCodesUntilRet(ubyte[] opbytes, ulong addr) {
+      string[] opbytes_str = [];
+      auto irs = cs.disasm(opbytes, addr);
+      foreach (ir; irs) {
+        opbytes_str ~= ir.bytes.formatOpbytes();
+      }
+      // long pad_length = opbytes_str.map!(x => x.length).reduce!((a, b) => max(a, b));
+      const long pad_length = 32;
+
+      foreach (i, ir; irs) {
+        msg("0x%x\t%s\t%s %s".format(ir.addr, opbytes_str[i].leftJustifier(pad_length), ir.opcode, ir.operand));
+        if (ir.opcode == "ret") {
+          return true;
+        }
+      }
+      return false;
+    }
+
 
     void disasmBytes(ubyte[] opbytes, ulong addr) {
       string[] opbytes_str = [];
@@ -163,8 +210,8 @@ class DDB {
       this.pid = execTarget([elf_name] ~ args);
       this.log("target pid is: %d".format(pid));
 
-      target_running = true;
       first_break = true;
+      target_running = true;
       return false;
     }
 
@@ -175,9 +222,13 @@ class DDB {
         return true;
       }
 
-      ulong addr = 0;
+      if (auto f = args[0] in this.funcs) {
+        setBreakpoint(f.addr + this.load_addr);
+        return true;
+      }
+
       try {
-        addr = parseAddr(args[0]);
+        auto addr = fromAddr(args[0]);
         setBreakpoint(addr);
       }
       catch (Exception e) {
@@ -197,15 +248,46 @@ class DDB {
     }
 
     bool cmdDisasm(string[] args) {
+      auto f = (ulong addr) {
+        auto read_len = 800;
+        auto offset = 0;
+        while (true) {
+          auto codes = getCodes(addr + offset, read_len);
+          offset += read_len;
+          if (printCodesUntilRet(codes, addr + offset)) {
+            break;
+          }
+        }
+      };
+
       if (args.length == 0) {
+        auto eip = elf.registerOf(regs, (elf.bitLength == 64) ? "rip" : "eip");
+        f(eip);
+        return true;
+      }
+
+      if (args[0] == "help") {
         this.log("<Usage>: disasm addr", false);
         return true;
       }
 
       if (auto func = args[0] in this.funcs) {
-        disasmBytes(func.opbytes, func.addr);
-      } else {
-        this.log("no such function: " ~ args[0], false);
+        if (target_running) {
+          f(func.addr + this.load_addr);
+        }
+        else {
+          disasmBytes(func.opbytes, func.addr);
+        }
+        return true;
+      }
+
+      try {
+        auto addr = args[0].fromAddr();
+        getCodes(addr, 20 * elf.bitLength);
+        return true;
+      }
+      catch (Exception e) {
+        this.log("no function or addr: " ~ args[0], false);
       }
       return true;
     }
@@ -236,10 +318,8 @@ class DDB {
       // (bytes, jumpto)[addr]
       auto graph = makeJumpgraph(this.funcs[fname], this.cs);
       foreach (addr; graph.keys.sort) {
-        // addr: [{jumpto1,  jumpto2, ...}, {jumpfrom1, jumpfrom2, ...}]
-        string jumpto = "{%s}".format(graph[addr].jumpto.map!(x => "0x%x".format(x)).join(", "));
-        string jumpfrom = "{%s}".format(graph[addr].jumpfrom.map!(x => "0x%x".format(x)).join(", "));
-        string heading = "0x%x:[%s, %s]".format(addr, jumpto, jumpfrom);
+        // addr: [jumpto1,  jumpto2, ...]
+        string heading = "0x%x:[%s]".format(addr, graph[addr].jumpto.map!(x => "0x%x".format(x)).array.join(", "));
         this.msg(cast(string)heading);
         
         // if -a is specified, show disassemble of block
@@ -249,28 +329,6 @@ class DDB {
           this.msg("");
           popPrefix();
         }
-      }
-      return true;
-    }
-
-    // main work
-    bool cmdAnalyze(string[] args) {
-      if (args.length < 1) {
-        this.log("<Usage>: banalyze func <break points>", false);
-        return true;
-      }
-      auto fname = args[0];
-      if (fname !in this.funcs) {
-        this.log("no such function: " ~ fname, false);
-        return true;
-      }
-
-      // (bytes, jumpto)[addr]
-      auto graph = makeJumpgraph(this.funcs[fname], this.cs);
-
-      ulong[] bps;
-      foreach (a; args[1..$]) {
-        bps ~= parseAddr(a);
       }
       return true;
     }
@@ -365,25 +423,15 @@ class DDB {
       }
     }
 }
-ulong parseAddr(string addrstr) {
-  if (addrstr.startsWith("0x") || addrstr.startsWith("0X")) {
-    return addrstr[2..$].to!ulong(16);
-  }
-
-  throw new Exception("unimplemented");
-}
-string toAddr(ulong addr) {
-  return "0x" ~ addr.to!string(16);
-}
-
 
 DDB ddb = null;
 
-alias AsmBlock = Tuple!(ubyte[], "opbytes", ulong[], "jumpto", ulong[], "jumpfrom");
 
-AsmBlock[ulong] makeJumpgraph(debugger.Function f, Capstone cs) {
-  AsmBlock[ulong] blocks;
-  ulong[][ulong] jumpfroms;
+alias AsmBlock = Tuple!(ubyte[], "opbytes", ulong[], "jumpto");
+alias AsmBlocks = AsmBlock[ulong];
+
+AsmBlocks makeJumpgraph(debugger.Function f, Capstone cs) {
+  AsmBlocks blocks;
 
   const auto start_addr = f.addr;
   const auto end_addr = f.addr + f.opbytes.length;
@@ -410,13 +458,7 @@ AsmBlock[ulong] makeJumpgraph(debugger.Function f, Capstone cs) {
           if (!(start_addr <= target && target <= end_addr)) {
             throw new DDBException("unsupported jump target");
           }
-          blocks[irs[start_i].addr] = AsmBlock(f.opbytes[offsetof[start_i]..offsetof[i] + irs[i].bytes.length], [target], []);
-          if (target in jumpfroms) {
-            jumpfroms[target] ~= irs[start_i].addr;
-          } else {
-            jumpfroms[target] = [irs[start_i].addr];
-          }
-
+          blocks[irs[start_i].addr] = AsmBlock(f.opbytes[offsetof[start_i]..offsetof[i] + irs[i].bytes.length], [target]);
           if (target !in blocks) {
             loopf(addr_to_index[target]);
           }
@@ -436,18 +478,7 @@ AsmBlock[ulong] makeJumpgraph(debugger.Function f, Capstone cs) {
             throw new DDBException("unsupported jump target");
           }
 
-          blocks[irs[start_i].addr] = AsmBlock(f.opbytes[offsetof[start_i]..offsetof[i] + irs[i].bytes.length], [target1, target2], []);
-          if (target1 in jumpfroms) {
-            jumpfroms[target1] ~= irs[start_i].addr;
-          } else {
-            jumpfroms[target1] = [irs[start_i].addr];
-          }
-          if (target2 in jumpfroms) {
-            jumpfroms[target2] ~= irs[start_i].addr;
-          } else {
-            jumpfroms[target2] = [irs[start_i].addr];
-          }
-
+          blocks[irs[start_i].addr] = AsmBlock(f.opbytes[offsetof[start_i]..offsetof[i] + irs[i].bytes.length], [target1, target2]);
           if (target1 !in blocks) {
             loopf(addr_to_index[target1]);
           }
@@ -460,92 +491,14 @@ AsmBlock[ulong] makeJumpgraph(debugger.Function f, Capstone cs) {
       }
     }
     if (i == irs.length) {
-      blocks[irs[start_i].addr] = AsmBlock(f.opbytes[offsetof[start_i]..offsetof[i-1] + irs[i-1].bytes.length], cast(ulong[])[], []);
+      blocks[irs[start_i].addr] = AsmBlock(f.opbytes[offsetof[start_i]..offsetof[i-1] + irs[i-1].bytes.length], cast(ulong[])[]);
     }
   };
   loopf(0);
 
-  foreach (k; blocks.keys) {
-    if (k in jumpfroms) {
-      blocks[k].jumpfrom = jumpfroms[k];
-    }
-  }
-
   return blocks;
 }
 
-
-auto getRoots(AsmBlock[ulong] graph, ulong entry) {
-  /// IDEA: Node 毎に持たずとも root からの全経路みたいなのを持っておけばよいのでは？？
-  ///  ↑いまの探索でも自然にそうなる
-  ulong[][][ulong] roots;  // 経路のリスト（をNode毎にもつ）
-  int [ulong][ulong] loop_nodes;  // from, to の間に loop があることを示す（無向
-  ulong[] exploring;  // 探索中であることを表すリスト
-  
-  // 経路のリストを返す
-  ulong[][] delegate(ulong) loopf;
-
-  // 経路全探索する
-  loopf = (ulong addr) {
-    // メモがあれば使う
-    if (addr in roots) {
-      return roots[addr];
-    }
-    exploring ~= addr; // このNodeを含む経路をたどっていることを示しておく
-
-    /*
-    == 省略される点にBreakPointを仕掛ける場合に、その点がなくなってしまうので死ぬ。それが治ったらこれをコメントインして ==
-    // 1個しかジャンプ先がない場合はそちらに処理を任せてこちらの情報は保存しない（男らしい）
-    if (graph[addr].jumpto.length == 1) {
-      auto to = graph[addr].jumpto[0];
-
-      // 探索中ならループするという情報だけを入れておく
-      if (exploring.canFind(to)) {
-        loop_nodes[addr][to] = 1;
-        exploring.popBack(); 
-        ulong[][] dummy;  // ここからの経路はないのでこうする
-        return dummy;
-      }
-
-      auto r = loopf(to);
-
-      // entryが存在しないとあとで死ぬ
-      if (addr == entry) {
-        roots[entry] = r;
-      }
-
-      exploring.popBack();  // たどり終えた
-      return r;
-    }
-    */
-
-
-    ulong[][] node_roots = [];  // このNode からたどる経路
-    // このNodeから伸びている先
-    foreach (to; graph[addr].jumpto) {
-      // 探索中ならループするという情報だけを入れておく
-      if (exploring.canFind(to)) {
-        loop_nodes[addr][to] = 1;
-        continue;
-      }
-
-      auto to_roots = loopf(to);  // 伸びている先の伸びている先……と辿った経路
-      if (to_roots.length == 0) {
-        node_roots ~= [to];  // 先が行き止まりだったらこう
-      } else {
-        foreach (r; to_roots) {
-          node_roots ~= (to ~ r);  // 伸びた先も追加しておいて……ということ
-        }
-      }
-    }
-
-    exploring.popBack();  // たどり終えた
-    return roots[addr] = node_roots;
-  };
-  loopf(entry);
-
-  return roots[entry];
-}
 
 
 auto execTarget(string[] args) {
@@ -563,6 +516,19 @@ auto execTarget(string[] args) {
   return pid;
 }
 
+ulong fromAddr(string addrstr) {
+  if (addrstr.startsWith("0x") || addrstr.startsWith("0X")) {
+    return addrstr[2..$].to!ulong(16);
+  }
+
+  throw new Exception("unimplemented");
+}
+
+string toAddrStr(ulong addr) {
+  return "0x08%x".format(addr);
+}
+
+
 string formatOpbytes(ubyte[] bytes) {
   string[] buf = [];
   foreach (b; bytes) {
@@ -571,175 +537,19 @@ string formatOpbytes(ubyte[] bytes) {
   return buf.join(" ");
 }
 
-long linearSearch(E)(E[] range, E element) {
-  foreach (i, e; range) {
-    if (element == e) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-
-/// return true if x including all bits of y 
-bool binaryIncluding(ulong x, ulong y) {
-  return ((~x)&y) == 0;
-}
-
-/// Make Hasse Diagram
-/// O(N^3)
-/// return ulong to[ulong from] 
-auto makeHasseDiagram(ulong[] xs) {
-  auto rel = new int[][](xs.length, xs.length);
-  ulong[][ulong] rel2; // key: from, values: to
-  
-  /// make graph
-  foreach (i; 0..xs.length) {
-    foreach (j; (i+1)..xs.length) {
-      if (xs[i] == xs[j]) {
-        continue;
-      }
-
-      /// if xs[i] includeing xs[j] then j < i
-      if (xs[i].binaryIncluding(xs[j])) {
-        rel[j][i] = 1;
-        if (j !in rel2) {
-          rel2[j] = [];
-        }
-        rel2[j] ~= i;
-      }
-      if (xs[j].binaryIncluding(xs[i])) {
-        rel[i][j] = 1;
-        if (i !in rel2) {
-          rel2[i] = [];
-        }
-        rel2[i] ~= j;
-      }
-    }
-  }
-
-  ulong[][ulong] rel3;  // key: from, value: to
-  /// transitive reduction
-  foreach (from, tos; rel2) {
-    ulong[] excludes = [];
-    foreach (i, x; tos) {
-      foreach (j, y; tos) {
-        // if x < y then y is not required
-        if (rel[x][y] == 1) {
-          excludes ~= y;
-        }
-      }
-    }
-    rel3[from] = tos.filter!(x => !excludes.canFind(x)).array;
-  }
-
-  return rel3;
-}
-
-
 void main(string[] args)
 {
-  if (args.length < 4) {
-    writefln("<Usage>%s <target> <funcname> <numof_bpreg> <breakpoints>", args[0]);
+  if (args.length == 1) {
+    writefln("<Usage>%s <target>", args[0]);
     return;
   }
-
-  auto elf = readELF(args[1]);
-  Capstone cs;
-  auto funcs = elf.functions();
-
-  if (cast(ELF32)(elf) !is null) {
-    cs = new Capstone(cs_arch.CS_ARCH_X86, cs_mode.CS_MODE_32);
-  } else if (cast(ELF64)(elf) !is null) {
-    cs = new Capstone(cs_arch.CS_ARCH_X86, cs_mode.CS_MODE_64);
-  }
-  auto funcname = args[2];
-  auto numof_bpreg = args[3].to!int;
-  auto bps = args[4..$].map!(parseAddr).array;
-
-  // グラフを作る
-  auto graph = makeJumpgraph(funcs[funcname], cs);
-
-  // 経路を取る
-  auto roots = getRoots(graph, funcs[funcname].addr);
-  writeln("roots:");
-  foreach (r; roots) {
-    write("\t");
-    writeln(r.map!(toAddr).join("->"));
-  }
-
-
-  // ブレークポイントを仕掛けたい点(key)と、その点でBreakするためにはここに仕掛けるとよい、という点 value
-  ulong[][ulong] bp_a; 
-  foreach (addr; bps) {
-    ulong[][] addr_roots = [];
-
-    foreach (i, r; roots) {
-      auto u = r.linearSearch(addr);
-      if (u != -1) {  // アドレスAを含む
-        addr_roots ~= r[0..u+1];
-      }
+  
+  // ELF を解析
+  ddb = new DDB(args[1]);
+  while (true) {
+    if (ddb.target_running) {
+      ddb.wait();
     }
-
-    if (addr_roots.length == 0) {
-      continue;
-    }
-
-    // 複数の経路で共通のNodeを探す
-    // なければそこにはBPしかけなくていい
-    ulong[] intersects = addr_roots[0];
-    foreach (i; 1..addr_roots.length) {
-      intersects = setIntersection(intersects, addr_roots[i]).array;
-    }
-
-    bp_a[addr] = intersects;
+    ddb.cmdRepl();
   }
-
-  ulong[][ulong]  rev_bp_a;  /// bp_a の逆。BreakPointの候補点がKeyになっている
-  foreach (v, ks; bp_a) {
-    foreach (k; ks) {
-      if (k !in rev_bp_a) {
-        rev_bp_a[k] = [];
-      }
-      rev_bp_a[k] ~= v;
-    }
-  }
-
-  // ブレークポイントの候補点を並べて2進変換
-  const DUMMY_ADDR = ulong.max;
-  ulong[] bp_binvalues = [0];
-  ulong[] bp_keys = [DUMMY_ADDR];
-  foreach (k, v; rev_bp_a) {
-    ulong x = 0;
-    foreach(i, bp; bps) {
-      if (v.canFind(bp)) {
-        x |= 1 << i;
-      }
-    }
-    bp_keys ~= k;
-    bp_binvalues ~= x;
-  }
-
-
-  writeln("\nWanna BreakPoint to Break Candidates");
-  foreach (k; bp_a.keys) {
-    writeln("\t", k.toAddr(), ": ", bp_a[k].map!(toAddr).join(","));
-  }
-
-  writeln("\nBreak Candidates to Wanna BreakPoint");
-  foreach (k; rev_bp_a.keys) {
-    writeln("\t", k.toAddr(), ": ", rev_bp_a[k].map!(toAddr).join(","));
-  }
-
-  writeln("\nBinary form of Break Candidates");
-  foreach (i, k; bp_keys) {
-    writefln("\t%s: %08b".format(k.toAddr(), bp_binvalues[i]));
-  }
-
-  auto hassemap = makeHasseDiagram(bp_binvalues);
-  writeln("\nOrder of Break Candidates");
-  foreach (from, tos; hassemap) {
-    writefln("\t%s -> %s".format(bp_keys[from].toAddr, tos.map!(x => bp_keys[x].toAddr).array.join(", ")));
-  }
-
 }
