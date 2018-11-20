@@ -60,3 +60,21 @@ bool set_hw_breakpoint_to(pid_t pid, ulong addr, uint r) {
   }
   return true;
 }
+
+// pid のプロセスのDRr 番の  HW BP を削除する。
+bool unset_hw_breakpoint_to(pid_t pid, uint r) {
+  if (!(0 <= r && r < 4)) {
+    return false;
+  }
+
+  dr7_t dr7 = cast(uint)(ptrace(PTRACE_PEEKUSER, pid, cast(void*)offsetof_dr(7), null));
+  // 必要な情報を書き込む
+  dr7.set_local(r, 0);  // local disable for braekpoint in DRr
+  dr7.set_RW(r, BreakOn.EXEC);  // when that address is executed 
+  dr7.set_length(r, BreakLength.LEN1);
+
+  if (ptrace(PTRACE_POKEUSER, pid, cast(void*)offsetof_dr(7), cast(void*)dr7) != 0) {
+    return false;
+  }
+  return true;
+}

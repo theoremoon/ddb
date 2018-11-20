@@ -38,6 +38,9 @@ class DDB {
     ulong[] break_addrs = [];
     ubyte[] regs = [];
 
+    ulong[] wannabreaks = [];
+    ulong[] tmpbreaks = [];
+
     string[] messages = [];
     string[] prefixes = [];
     alias CommandT = bool delegate(string[]);
@@ -93,6 +96,30 @@ class DDB {
       stdout.flush();
     }
 
+    auto readWhileNextJump(ulong addr) {
+      auto cond_irs = ["je", "jne", "jb", "jbe", "jl", "jle"];
+      const auto len = 800;
+      auto offset = 0;
+      while (true) {
+        auto codes = getCodes(addr + offset, len);
+        auto irs = cs.disasm(codes, addr + offset);
+
+        foreach (ir; irs) {
+          if (cond_irs.canFind(ir.opcode)) {
+            auto operand1 = ir.addr + ir.bytes.length;
+            auto operand2 = ir.operand.stripLeft("0x").stripLeft("0X").to!ulong(16);
+            return tuple(ir.addr, operand1, operand2);
+          }
+          if (ir.opcode == "jmp") {
+            return tuple(ir.addr, ir.operand.stripLeft("0x").stripLeft("0X").to!ulong(16), cast(ulong)0);
+          }
+        }
+
+        offset += len;
+      }
+      assert(0);
+    }
+
     void wait() {
       // wait break
       int status;
@@ -100,7 +127,6 @@ class DDB {
       if (!WIFSTOPPED(status)) {
         target_running = false;
       }
-
 
       // get register
       if (target_running) {
@@ -111,6 +137,32 @@ class DDB {
 
         auto eip = elf.registerOf(regs, (elf.bitLength == 64) ? "rip" : "eip");
         this.log("break at 0x%x".format(eip));
+
+        // temporarily broke
+        if (tmpbreaks.canFind(eip)) {
+          removeAllHardwareBreakpoints();
+
+          auto next = readWhileNextJump(eip);
+          foreach (wb; wannabreaks) {
+            if (eip < wb && wb <= next[0]) {
+              // set breakpoint at wb
+              setBreakpoint(wb);
+            }
+          }
+          setBreakpoint(next[1]);
+          if (next[2] == 0) {
+            tmpbreaks = [next[1]];
+          }
+          else {
+            setBreakpoint(next[2]);
+            tmpbreaks = [next[1], next[2]];
+          }
+
+          // restart without interaction
+          ptrace(PTRACE_CONT, pid, null, null);
+          wait();
+          return;
+        }
 
 
         if (first_break) {
@@ -127,6 +179,13 @@ class DDB {
           this.load_addr = text_section[0].until("-").to!(string).to!(ulong)(16);
         }
       }
+    }
+
+    void removeAllHardwareBreakpoints() {
+      foreach (i, _; this.break_addrs) {
+        unset_hw_breakpoint_to(pid, cast(uint)i);
+      }
+      this.break_addrs.length = 0;
     }
 
     void setBreakpoint(ulong addr) {
@@ -223,13 +282,13 @@ class DDB {
       }
 
       if (auto f = args[0] in this.funcs) {
-        setBreakpoint(f.addr + this.load_addr);
+        this.wannabreaks ~= f.addr + this.load_addr;
         return true;
       }
 
       try {
         auto addr = fromAddr(args[0]);
-        setBreakpoint(addr);
+        this.wannabreaks ~= addr;
       }
       catch (Exception e) {
         this.log("invalid address: " ~ args[0], false);
@@ -242,6 +301,28 @@ class DDB {
         this.log("program isn't running", false);
         return true;
       }
+      // ---
+      if (wannabreaks.length > 0) {
+          removeAllHardwareBreakpoints();
+
+          auto eip = elf.registerOf(regs, (elf.bitLength == 64) ? "rip" : "eip");
+          auto next = readWhileNextJump(eip);
+          foreach (wb; wannabreaks) {
+            if (eip < wb && wb <= next[0]) {
+              // set breakpoint at wb
+              setBreakpoint(wb);
+            }
+          }
+          setBreakpoint(next[1]);
+          if (next[2] == 0) {
+            tmpbreaks = [next[1]];
+          }
+          else {
+            setBreakpoint(next[2]);
+            tmpbreaks = [next[1], next[2]];
+          }
+      }
+      // ---
 
       ptrace(PTRACE_CONT, pid, null, null);
       return false;
