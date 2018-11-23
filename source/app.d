@@ -586,56 +586,6 @@ bool binaryIncluding(ulong x, ulong y) {
   return ((~x)&y) == 0;
 }
 
-/// Make Hasse Diagram
-/// O(N^3)
-/// return ulong to[ulong from] 
-auto makeHasseDiagram(ulong[] xs) {
-  auto rel = new int[][](xs.length, xs.length);
-  ulong[][ulong] rel2; // key: from, values: to
-  
-  /// make graph
-  foreach (i; 0..xs.length) {
-    foreach (j; (i+1)..xs.length) {
-      if (xs[i] == xs[j]) {
-        continue;
-      }
-
-      /// if xs[i] includeing xs[j] then j < i
-      if (xs[i].binaryIncluding(xs[j])) {
-        rel[j][i] = 1;
-        if (j !in rel2) {
-          rel2[j] = [];
-        }
-        rel2[j] ~= i;
-      }
-      if (xs[j].binaryIncluding(xs[i])) {
-        rel[i][j] = 1;
-        if (i !in rel2) {
-          rel2[i] = [];
-        }
-        rel2[i] ~= j;
-      }
-    }
-  }
-
-  ulong[][ulong] rel3;  // key: from, value: to
-  /// transitive reduction
-  foreach (from, tos; rel2) {
-    ulong[] excludes = [];
-    foreach (i, x; tos) {
-      foreach (j, y; tos) {
-        // if x < y then y is not required
-        if (rel[x][y] == 1) {
-          excludes ~= y;
-        }
-      }
-    }
-    rel3[from] = tos.filter!(x => !excludes.canFind(x)).array;
-  }
-
-  return rel3;
-}
-
 
 void main(string[] args)
 {
@@ -655,7 +605,7 @@ void main(string[] args)
   }
   auto funcname = args[2];
   auto numof_bpreg = args[3].to!int;
-  auto bps = args[4..$].map!(parseAddr).array;
+  auto wannabreaks = args[4..$].map!(parseAddr).array;
 
   // グラフを作る
   auto graph = makeJumpgraph(funcs[funcname], cs);
@@ -670,8 +620,8 @@ void main(string[] args)
 
 
   // ブレークポイントを仕掛けたい点(key)と、その点でBreakするためにはここに仕掛けるとよい、という点 value
-  ulong[][ulong] bp_a; 
-  foreach (addr; bps) {
+  ulong[][ulong] to_breaks; 
+  foreach (addr; wannabreaks) {
     ulong[][] addr_roots = [];
 
     foreach (i, r; roots) {
@@ -692,32 +642,30 @@ void main(string[] args)
       intersects = setIntersection(intersects, addr_roots[i]).array;
     }
 
-    bp_a[addr] = intersects;
+    to_breaks[addr] = intersects;
   }
 
-  ulong[][ulong]  rev_bp_a;  /// bp_a の逆。BreakPointの候補点がKeyになっている
+  ulong[][ulong]  rev_to_breaks;  /// bp_a の逆。BreakPointの候補点がKeyになっている
   foreach (v, ks; bp_a) {
     foreach (k; ks) {
-      if (k !in rev_bp_a) {
-        rev_bp_a[k] = [];
+      if (k !in rev_to_breaks) {
+        rev_to_breaks[k] = [];
       }
-      rev_bp_a[k] ~= v;
+      rev_to_breaks[k] ~= v;
     }
   }
 
   // ブレークポイントの候補点を並べて2進変換
-  const DUMMY_ADDR = ulong.max;
-  ulong[] bp_binvalues = [0];
-  ulong[] bp_keys = [DUMMY_ADDR];
-  foreach (k, v; rev_bp_a) {
+  ulong[ulong] break_bins;
+  foreach (to_break, w_breaks; rev_to_breaks) {
     ulong x = 0;
-    foreach(i, bp; bps) {
-      if (v.canFind(bp)) {
+    foreach(i, wannap; wannabreaks) {
+      if (w_breaks.canFind(wannap)) {
         x |= 1 << i;
       }
     }
-    bp_keys ~= k;
-    bp_binvalues ~= x;
+
+    break_bins[to_break] = x;
   }
 
 
@@ -734,12 +682,6 @@ void main(string[] args)
   writeln("\nBinary form of Break Candidates");
   foreach (i, k; bp_keys) {
     writefln("\t%s: %08b".format(k.toAddr(), bp_binvalues[i]));
-  }
-
-  auto hassemap = makeHasseDiagram(bp_binvalues);
-  writeln("\nOrder of Break Candidates");
-  foreach (from, tos; hassemap) {
-    writefln("\t%s -> %s".format(bp_keys[from].toAddr, tos.map!(x => bp_keys[x].toAddr).array.join(", ")));
   }
 
 }
