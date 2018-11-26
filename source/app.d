@@ -587,6 +587,49 @@ bool binaryIncluding(ulong x, ulong y) {
 }
 
 
+// breakする点で探索する
+// breakしたい点M > HardwareBreakpointの数N だとうまく行かないように見えるかもしれないが
+// 少なくともどこかに現在地の直後の点が存在するはずなので保証はある
+// でも失敗するかもしれないので一応 bool で成否を帰している
+Tuple!(bool, ulong[]) search_break_set(uint numof_bpreg, ulong[][ulong]to_breaks, ulong[ulong] breakpoint_binexpr) {
+  const uint ideal_binexpr = (1 << to_breaks.keys.length) - 1;
+  ulong[][] breakpoints = to_breaks.values;
+  Tuple!(bool, ulong[]) delegate(ulong[], ulong, int) f;
+
+  // 現状breakするということにした点
+  // 現状でカバーできる範囲の2進数表記
+  // 探索する点のindex
+  // 絶対全探索以外の方法があると思うんだが ^ ^
+  // 計算量は N = numof_wannabreak, to_breaksの各配列の要素数をそれぞれM_i として
+  // O(M_1 * M_2 * ... * M_N) です
+  f = (ulong[] current_points, ulong current_x, int index) {
+    if (current_points.length == numof_bpreg || index >= breakpoints.length) {
+      return tuple(false, cast(ulong[])[]);
+    }
+
+    foreach (bp; breakpoints[index]) {
+      auto bin = breakpoint_binexpr[bp];
+      if (! binaryIncluding(current_x, bin)) {
+        writefln("trying: [%s](0b%08b)", (current_points ~ bp).map!(toAddr).join(", "), current_x | bin);
+        if ((current_x | bin) == ideal_binexpr) {
+          return tuple(true, current_points ~ bp);  // 見つけた
+        }
+        
+        // とりあえず加えてみて探索
+        auto r = f(current_points ~ bp, current_x | bin, index + 1);
+        if (r[0] == true) {
+          return r;
+        }
+      }
+    }
+    return f(current_points, current_x, index+1);
+  };
+
+  auto r = f([], 0, 0);
+  return r;
+}
+
+
 void main(string[] args)
 {
   if (args.length < 4) {
@@ -620,11 +663,11 @@ void main(string[] args)
 
 
   // break される点をkeyにして、breakできる点をリストとして持つ
-  // breakできる個数でソートするといい感じ
   ulong[][ulong] to_breaks; 
   ulong[ulong] breakpoint_breakablenums;
+  ulong[ulong] breakpoint_binexpr;
 
-  foreach (addr; wannabreaks) {
+  foreach (j, addr; wannabreaks) {
     ulong[][] addr_roots = [];
 
     foreach (i, r; roots) {
@@ -654,18 +697,38 @@ void main(string[] args)
       } else {
         breakpoint_breakablenums[p] = 1;
       }
+
+      if (p in breakpoint_binexpr) {
+        breakpoint_binexpr[p] |= 1 << j;
+      } else {
+        breakpoint_binexpr[p] = 1 << j;
+      }
     }
   }
 
-
+  // breakできる個数でソートするといい感じ
   foreach (ref breakpoints; to_breaks) {
     breakpoints.sort!((x, y) => breakpoint_breakablenums[x] < breakpoint_breakablenums[y]);
   }
   
-  foreach (wanna_break, breaks; to_breaks) {
-    writeln("break at: " ~ wanna_break.toAddr());
-    foreach (p; breaks) {
-      writeln("\t" ~ p.toAddr());
-    }
+  foreach (addr, binexpr; breakpoint_binexpr) {
+    writefln("%s:  0b%08b", addr.toAddr(), binexpr);
+  }
+
+  foreach (key, values; to_breaks) {
+    write(key.toAddr() ~ ": ");
+    writeln(values.map!(toAddr).join(", "));
+  }
+
+  // breakする点で探索する
+  // breakしたい点M > HardwareBreakpointの数N だとうまく行かないように見えるかもしれないが
+  // 少なくともどこかに現在地の直後の点が存在するはずなので保証はある
+  auto r = search_break_set(numof_bpreg, to_breaks, breakpoint_binexpr);
+  if (r[0] == true) {
+    write("SET BREAKPOINT AT: ");
+    writeln(r[1].map!(toAddr).join(", "));
+  }
+  else {
+    writeln("SOMETHING BAD :(");
   }
 }
