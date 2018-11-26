@@ -619,8 +619,11 @@ void main(string[] args)
   }
 
 
-  // ブレークポイントを仕掛けたい点(key)と、その点でBreakするためにはここに仕掛けるとよい、という点 value
+  // break される点をkeyにして、breakできる点をリストとして持つ
+  // breakできる個数でソートするといい感じ
   ulong[][ulong] to_breaks; 
+  ulong[ulong] breakpoint_breakablenums;
+
   foreach (addr; wannabreaks) {
     ulong[][] addr_roots = [];
 
@@ -643,45 +646,26 @@ void main(string[] args)
     }
 
     to_breaks[addr] = intersects;
-  }
 
-  ulong[][ulong]  rev_to_breaks;  /// bp_a の逆。BreakPointの候補点がKeyになっている
-  foreach (v, ks; bp_a) {
-    foreach (k; ks) {
-      if (k !in rev_to_breaks) {
-        rev_to_breaks[k] = [];
-      }
-      rev_to_breaks[k] ~= v;
-    }
-  }
-
-  // ブレークポイントの候補点を並べて2進変換
-  ulong[ulong] break_bins;
-  foreach (to_break, w_breaks; rev_to_breaks) {
-    ulong x = 0;
-    foreach(i, wannap; wannabreaks) {
-      if (w_breaks.canFind(wannap)) {
-        x |= 1 << i;
+    // intersectsに含まれる各点がbreakできる個数を加算しておく
+    foreach (p; intersects) {
+      if (p in breakpoint_breakablenums) {
+        breakpoint_breakablenums[p] += 1;
+      } else {
+        breakpoint_breakablenums[p] = 1;
       }
     }
-
-    break_bins[to_break] = x;
   }
 
 
-  writeln("\nWanna BreakPoint to Break Candidates");
-  foreach (k; bp_a.keys) {
-    writeln("\t", k.toAddr(), ": ", bp_a[k].map!(toAddr).join(","));
+  foreach (ref breakpoints; to_breaks) {
+    breakpoints.sort!((x, y) => breakpoint_breakablenums[x] < breakpoint_breakablenums[y]);
   }
-
-  writeln("\nBreak Candidates to Wanna BreakPoint");
-  foreach (k; rev_bp_a.keys) {
-    writeln("\t", k.toAddr(), ": ", rev_bp_a[k].map!(toAddr).join(","));
+  
+  foreach (wanna_break, breaks; to_breaks) {
+    writeln("break at: " ~ wanna_break.toAddr());
+    foreach (p; breaks) {
+      writeln("\t" ~ p.toAddr());
+    }
   }
-
-  writeln("\nBinary form of Break Candidates");
-  foreach (i, k; bp_keys) {
-    writefln("\t%s: %08b".format(k.toAddr(), bp_binvalues[i]));
-  }
-
 }
