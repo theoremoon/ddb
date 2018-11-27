@@ -4,6 +4,8 @@ import std.process;
 import std.string;
 import std.typecons;
 import std.conv;
+import std.file;
+import std.path;
 import std.range;
 import std.array;
 import std.algorithm;
@@ -33,7 +35,11 @@ class DDB {
     bool first_break = true;
     pid_t pid = 0;
     ulong[] break_addrs = [];
+    ulong[] wanna_breaks = [];
+    ulong load_addr = 0x0;
     ubyte[] regs = [];
+    ulong ip;
+    ulong numof_regs = 0x0;
 
     string[] messages = [];
     string[] prefixes = [];
@@ -42,10 +48,11 @@ class DDB {
     CmdEntry[] command_table;
 
   public:
-    this(string elf_name) {
+    this(string elf_name, ulong numof_regs) {
       this.elf_name = elf_name;
       this.elf = readELF(elf_name);
       this.funcs = this.elf.functions();
+      this.numof_regs = numof_regs;
 
       if (cast(ELF32)(elf) !is null) {
         cs = new Capstone(cs_arch.CS_ARCH_X86, cs_mode.CS_MODE_32);
@@ -102,15 +109,19 @@ class DDB {
 
       // set hardware breakpoint when execve
       if (target_running && first_break) {
-        first_break = false;
-        foreach (i, addr; break_addrs) {
-          if (! set_hw_breakpoint_to(pid, addr, cast(int)i)) {
-            throw new Exception("[-]Failed to Set Haredware Breakpoint");
-          }
-        }
-        ptrace(PTRACE_CONT, pid, null, null);
+          first_break = false;
 
-        return this.wait();
+          // parse /proc/pid/maps and get real effective entry point address
+          auto elf_abspath = absolutePath(this.elf_name, getcwd());
+          auto maplines = readText("/proc/%d/maps".format(pid)).split("\n");
+          auto elf_sections = maplines.filter!(line => line.canFind(elf_abspath));
+          auto text_section = elf_sections.filter!(line => line.split(" ")[1].canFind('x')).array;
+          if (text_section.length == 0) {
+            throw new Exception("Failed to parse /prof/pid/maps"); 
+          }
+          this.load_addr = text_section[0].until("-").to!(string).to!(ulong)(16);
+
+          return;
       } 
 
       // get register
@@ -120,12 +131,13 @@ class DDB {
           throw new Exception("[-]failed to get regsiter");
         }
 
-        auto eip = elf.registerOf(regs, "eip");
-        this.log("break at 0x%x".format(eip));
+        this.ip = elf.registerOf(regs, (elf.bitLength == 64) ? "rip" : "eip");
+        this.log("break at 0x%x".format(this.ip));
       }
     }
 
     void setBreakpoint(ulong addr) {
+      /*
       if (break_addrs.length >= 4) {
         this.log("Hardware breakpoint can be set at most four.", false);
         return;
@@ -138,7 +150,50 @@ class DDB {
       }
       break_addrs ~= addr;
       this.log("set hardware breakpoint at 0x%x".format(addr));
+      */
+      wanna_breaks ~= addr;
     }
+
+    ubyte[] getCodes(long addr, ulong len) {
+      import std.bitmanip;
+      import std.system : Endian;
+
+      auto addr2 = addr;
+      auto cnt = 0;
+      ubyte[] codes = [];
+
+      while (cnt < len) {
+        // peek machine code 4 or 8 bytes
+        auto code = ptrace(PTRACE_PEEKDATA, pid, cast(void*)addr, null);
+        addr += elf.bitLength / 8;
+        cnt += elf.bitLength / 8;
+
+        // convert returned machine codes (long) to ubyte[]
+        ubyte[] buf = new ubyte[]( code.sizeof );
+        std.bitmanip.write!(typeof(code), Endian.littleEndian)(buf, code, 0);
+        codes ~= buf;
+      }
+
+      return codes;
+    }
+
+    bool printCodesUntilRet(ubyte[] opbytes, ulong addr) {
+      string[] opbytes_str = [];
+      auto irs = cs.disasm(opbytes, addr);
+      foreach (ir; irs) {
+        opbytes_str ~= ir.bytes.formatOpbytes();
+      }
+      // long pad_length = opbytes_str.map!(x => x.length).reduce!((a, b) => max(a, b));
+      const long pad_length = 32;
+
+      foreach (i, ir; irs) {
+        msg("0x%x\t%s\t%s %s".format(ir.addr, opbytes_str[i].leftJustifier(pad_length), ir.opcode, ir.operand));
+        if (ir.opcode == "ret") {
+          return true;
+        }
+      }
+      return false;
+}
 
     void disasmBytes(ubyte[] opbytes, ulong addr) {
       string[] opbytes_str = [];
@@ -191,6 +246,8 @@ class DDB {
         this.log("program isn't running", false);
         return true;
       }
+
+      auto r = select_breakpoints(this.cs, ubyte[] opbytes, ulong func_addr, current_addr, this.numof_regs, this.wanna_breaks);
 
       ptrace(PTRACE_CONT, pid, null, null);
       return false;
@@ -359,7 +416,6 @@ class DDB {
             writeln(messages.join("\n"));
         }
 
-
         // clear message buffer
         messages.length = 0;
       }
@@ -382,20 +438,24 @@ DDB ddb = null;
 alias AsmBlock = Tuple!(ubyte[], "opbytes", ulong[], "jumpto", ulong[], "jumpfrom");
 
 AsmBlock[ulong] makeJumpgraph(debugger.Function f, Capstone cs) {
+  return makeJumpgraph(f.opbytes, f.addr, cs);
+}
+
+AsmBlock[ulong] makeJumpgraph(ubyte[] opbytes, ulong addr, Capstone cs) {
   AsmBlock[ulong] blocks;
   ulong[][ulong] jumpfroms;
 
-  const auto start_addr = f.addr;
-  const auto end_addr = f.addr + f.opbytes.length;
-  const auto irs = cs.disasm(f.opbytes, f.addr);
+  const auto start_addr = addr;
+  const auto end_addr = addr + opbytes.length;
+  const auto irs = cs.disasm(opbytes, addr);
 
   ulong[] offsetof;
   ulong[ulong] addr_to_index;
-  ulong addr = 0;
+  ulong offset_addr = 0;
   foreach (i, ir; irs) {
-    offsetof ~= addr;
+    offsetof ~= offset_addr;
     addr_to_index[ir.addr] = i;
-    addr += ir.bytes.length;
+    offset_addr += ir.bytes.length;
   }
 
 
@@ -410,7 +470,7 @@ AsmBlock[ulong] makeJumpgraph(debugger.Function f, Capstone cs) {
           if (!(start_addr <= target && target <= end_addr)) {
             throw new DDBException("unsupported jump target");
           }
-          blocks[irs[start_i].addr] = AsmBlock(f.opbytes[offsetof[start_i]..offsetof[i] + irs[i].bytes.length], [target], []);
+          blocks[irs[start_i].addr] = AsmBlock(opbytes[offsetof[start_i]..offsetof[i] + irs[i].bytes.length], [target], []);
           if (target in jumpfroms) {
             jumpfroms[target] ~= irs[start_i].addr;
           } else {
@@ -436,7 +496,7 @@ AsmBlock[ulong] makeJumpgraph(debugger.Function f, Capstone cs) {
             throw new DDBException("unsupported jump target");
           }
 
-          blocks[irs[start_i].addr] = AsmBlock(f.opbytes[offsetof[start_i]..offsetof[i] + irs[i].bytes.length], [target1, target2], []);
+          blocks[irs[start_i].addr] = AsmBlock(opbytes[offsetof[start_i]..offsetof[i] + irs[i].bytes.length], [target1, target2], []);
           if (target1 in jumpfroms) {
             jumpfroms[target1] ~= irs[start_i].addr;
           } else {
@@ -460,7 +520,7 @@ AsmBlock[ulong] makeJumpgraph(debugger.Function f, Capstone cs) {
       }
     }
     if (i == irs.length) {
-      blocks[irs[start_i].addr] = AsmBlock(f.opbytes[offsetof[start_i]..offsetof[i-1] + irs[i-1].bytes.length], cast(ulong[])[], []);
+      blocks[irs[start_i].addr] = AsmBlock(opbytes[offsetof[start_i]..offsetof[i-1] + irs[i-1].bytes.length], cast(ulong[])[], []);
     }
   };
   loopf(0);
@@ -495,7 +555,7 @@ auto getRoots(AsmBlock[ulong] graph, ulong entry) {
 
     /*
     == 省略される点にBreakPointを仕掛ける場合に、その点がなくなってしまうので死ぬ。それが治ったらこれをコメントインして ==
-    // 1個しかジャンプ先がない場合はそちらに処理を任せてこちらの情報は保存しない（男らしい）
+    // 1個しかジャンプ先がない場合はそちらに処理を任せてこちらの情報は保存しない
     if (graph[addr].jumpto.length == 1) {
       auto to = graph[addr].jumpto[0];
 
@@ -629,37 +689,21 @@ Tuple!(bool, ulong[]) search_break_set(uint numof_bpreg, ulong[][ulong]to_breaks
   return r;
 }
 
-
-void main(string[] args)
-{
-  if (args.length < 4) {
-    writefln("<Usage>%s <target> <funcname> <numof_bpreg> <breakpoints>", args[0]);
-    return;
-  }
-
-  auto elf = readELF(args[1]);
-  Capstone cs;
-  auto funcs = elf.functions();
-
-  if (cast(ELF32)(elf) !is null) {
-    cs = new Capstone(cs_arch.CS_ARCH_X86, cs_mode.CS_MODE_32);
-  } else if (cast(ELF64)(elf) !is null) {
-    cs = new Capstone(cs_arch.CS_ARCH_X86, cs_mode.CS_MODE_64);
-  }
-  auto funcname = args[2];
-  auto numof_bpreg = args[3].to!int;
-  auto wannabreaks = args[4..$].map!(parseAddr).array;
+/// かなりメインの処理。breakしたい点を受け取ってどこにbreakpointを設置するか決定する
+auto select_breakpoints(Capstone cs, ubyte[] opbytes, ulong func_addr, ulong current_addr, long numof_bpreg, ulong[] wanna_breaks) {
+  //TODO: wanna_breaks はいまblockのアドレスが渡されることを期待しているので、
+  // 実際の命令のアドレスを受け取ってblockのアドレスに変換するようにする
 
   // グラフを作る
-  auto graph = makeJumpgraph(funcs[funcname], cs);
+  auto graph = makeJumpgraph(opbytes, func_addr, cs);
 
   // 経路を取る
-  auto roots = getRoots(graph, funcs[funcname].addr);
-  writeln("roots:");
-  foreach (r; roots) {
-    write("\t");
-    writeln(r.map!(toAddr).join("->"));
-  }
+  auto roots = getRoots(graph, current_addr);
+  // writeln("roots:");
+  // foreach (r; roots) {
+  //   write("\t");
+  //   writeln(r.map!(toAddr).join("->"));
+  // }
 
 
   // break される点をkeyにして、breakできる点をリストとして持つ
@@ -667,7 +711,9 @@ void main(string[] args)
   ulong[ulong] breakpoint_breakablenums;
   ulong[ulong] breakpoint_binexpr;
 
-  foreach (j, addr; wannabreaks) {
+  // 全経路のうち、breakしたい点を含むものを列挙する
+  // 経路数N, breakしたい点の数をMとしておよそ O(NM)
+  foreach (j, addr; wanna_breaks) {
     ulong[][] addr_roots = [];
 
     foreach (i, r; roots) {
@@ -681,17 +727,18 @@ void main(string[] args)
       continue;
     }
 
-    // 複数の経路で共通のNodeを探す
-    // なければそこにはBPしかけなくていい
+    // 複数の経路で共通のNodeを探す（＝＞通らない可能性がある点に仕掛けるのは無駄が大きいため）
+    // なければそこにはBPしかけなくていい（＝＞たどり着けないということなので）
     ulong[] intersects = addr_roots[0];
     foreach (i; 1..addr_roots.length) {
       intersects = setIntersection(intersects, addr_roots[i]).array;
     }
-
     to_breaks[addr] = intersects;
 
     // intersectsに含まれる各点がbreakできる個数を加算しておく
     foreach (p; intersects) {
+      // ある点がいくつのwannabreakに対処できるか集計する
+      // これは↓の1のビット数と同じになる
       if (p in breakpoint_breakablenums) {
         breakpoint_breakablenums[p] += 1;
       } else {
@@ -711,24 +758,40 @@ void main(string[] args)
     breakpoints.sort!((x, y) => breakpoint_breakablenums[x] < breakpoint_breakablenums[y]);
   }
   
-  foreach (addr, binexpr; breakpoint_binexpr) {
-    writefln("%s:  0b%08b", addr.toAddr(), binexpr);
-  }
-
-  foreach (key, values; to_breaks) {
-    write(key.toAddr() ~ ": ");
-    writeln(values.map!(toAddr).join(", "));
-  }
+  // foreach (addr, binexpr; breakpoint_binexpr) {
+  //   writefln("%s:  0b%08b", addr.toAddr(), binexpr);
+  // }
+  // foreach (key, values; to_breaks) {
+  //   write(key.toAddr() ~ ": ");
+  //   writeln(values.map!(toAddr).join(", "));
+  // }
 
   // breakする点で探索する
   // breakしたい点M > HardwareBreakpointの数N だとうまく行かないように見えるかもしれないが
   // 少なくともどこかに現在地の直後の点が存在するはずなので保証はある
-  auto r = search_break_set(numof_bpreg, to_breaks, breakpoint_binexpr);
-  if (r[0] == true) {
-    write("SET BREAKPOINT AT: ");
-    writeln(r[1].map!(toAddr).join(", "));
+  auto r = search_break_set(cast(uint)numof_bpreg, to_breaks, breakpoint_binexpr);
+  return r;
+}
+
+
+void main(string[] args)
+{
+  if (args.length < 4) {
+    writefln("<Usage>%s <target> <numof_bpreg>", args[0]);
+    return;
   }
-  else {
-    writeln("SOMETHING BAD :(");
+
+  auto elf = readELF(args[1]);
+  Capstone cs;
+  auto funcs = elf.functions();
+
+  if (cast(ELF32)(elf) !is null) {
+    cs = new Capstone(cs_arch.CS_ARCH_X86, cs_mode.CS_MODE_32);
+  } else if (cast(ELF64)(elf) !is null) {
+    cs = new Capstone(cs_arch.CS_ARCH_X86, cs_mode.CS_MODE_64);
   }
+  auto funcname = args[2];
+  auto numof_bpreg = args[3].to!int;
+  auto wannabreaks = args[4..$].map!(parseAddr).array;
+
 }
