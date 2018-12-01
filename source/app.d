@@ -631,7 +631,7 @@ Tuple!(bool, ulong[]) search_break_set(uint numof_bpreg, ulong[][ulong]to_breaks
     foreach (bp; breakpoints[index]) {
       auto bin = breakpoint_binexpr[bp];
       if (! binaryIncluding(current_x, bin)) {
-        writefln("trying: [%s](0b%08b)", (current_points ~ bp).map!(toAddr).join(", "), current_x | bin);
+        // writefln("trying: [%s](0b%08b)", (current_points ~ bp).map!(toAddr).join(", "), current_x | bin);
         if ((current_x | bin) == ideal_binexpr) {
           return tuple(true, current_points ~ bp);  // 見つけた
         }
@@ -747,10 +747,20 @@ void main(string[] args)
   
   // ELF を解析
   ddb = new DDB(args[1], args[2].to!int);
+
+  ddb.evalCmd(["s"]);
+  ddb.wait();
+  ddb.evalCmd(["hb", "0x401146"]);
+  ddb.evalCmd(["c"]);
+  ddb.wait();
+  ddb.evalCmd(["b", "0x401256"]);
+  ddb.evalCmd(["b", "0x401248"]);
+  ddb.evalCmd(["b", "0x40123a"]);
+  ddb.evalCmd(["b", "0x4011f2"]);
   while (true) {
+    ddb.cmdRepl();
     if (ddb.target_running) {
       ddb.wait();
     }
-    ddb.cmdRepl();
   }
 }
