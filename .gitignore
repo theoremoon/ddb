@@ -14,4 +14,5 @@ ddb-test-*
 *.obj
 *.lst
 ddb
-target
+target/*asm
+target/target
