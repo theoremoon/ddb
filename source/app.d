@@ -39,7 +39,7 @@ class DDB {
     ulong load_addr = 0x0;
     ubyte[] regs = [];
     ulong ip;
-    ulong numof_regs = 0x0;
+    ulong dregnum = 0x0;
 
     string[] messages = [];
     string[] prefixes = [];
@@ -48,11 +48,11 @@ class DDB {
     CmdEntry[] command_table;
 
   public:
-    this(string elf_name, ulong numof_regs) {
+    this(string elf_name, ulong dregnum) {
       this.elf_name = elf_name;
       this.elf = readELF(elf_name);
       this.funcs = this.elf.functions();
-      this.numof_regs = numof_regs;
+      this.dregnum = dregnum;
 
       if (cast(ELF32)(elf) !is null) {
         cs = new Capstone(cs_arch.CS_ARCH_X86, cs_mode.CS_MODE_32);
@@ -62,15 +62,20 @@ class DDB {
 
       this.command_table = [
         CmdEntry(["s", "start"], "tart target program", &cmdStart),
-        CmdEntry(["b", "break"], "set hadware breakpoint at addr", &cmdBreak),
+        // CmdEntry(["b", "break"], "reserve hadware breakpoint at addr", &cmdBreak),
+        CmdEntry(["hb", "hbreak"], "set hadware breakpoint at addr", &cmdHBreak),
         CmdEntry(["c", "cont", "continue"], "continue execution", &cmdContinue),
         CmdEntry(["fls", "funcs", "functions"], "list function symbols", &cmdFunctions),
         CmdEntry(["d", "dis", "disasm"], "disassemble function", &cmdDisasm),
-        CmdEntry(["g", "gengraph"], "generate jumpgraph", &cmdGengraph),
-        CmdEntry(["a", "analy"], "analyze jumpgraph", &cmdAnalyze),
         CmdEntry(["h", "?", "help"], "show help", &cmdHelp),
         CmdEntry(["exit"], "exit debugger", (string[] args) { this.exit(); return true; }),
       ];
+    }
+
+    ~this (){
+      if (target_running) {
+        ptrace(PTRACE_KILL, pid, null, null);
+      }
     }
 
     void exit() {
@@ -88,10 +93,12 @@ class DDB {
       this.prefixes.popBackN(1);
     }
 
+    // stack messages temoporarily
     void msg(string s) {
       messages ~= prefixes.join("") ~ s;
     }
 
+    // print log immediately
     void log(string msg, bool positive=true) {
       auto prefix = positive? "[+]" : "[-]";
       writeln(prefix ~ msg);
@@ -105,14 +112,16 @@ class DDB {
       waitpid(pid, &status, 0);
       if (!WIFSTOPPED(status)) {
         target_running = false;
+        this.log("process exit with status %d".format(status));
+        return;
       }
 
-      // set hardware breakpoint when execve
-      if (target_running && first_break) {
+      // at first break (in libc's function)
+      if (first_break) {
           first_break = false;
 
           // parse /proc/pid/maps and get real effective entry point address
-          auto elf_abspath = absolutePath(this.elf_name, getcwd());
+          auto elf_abspath = absolutePath(this.elf_name, getcwd()).asNormalizedPath();
           auto maplines = readText("/proc/%d/maps".format(pid)).split("\n");
           auto elf_sections = maplines.filter!(line => line.canFind(elf_abspath));
           auto text_section = elf_sections.filter!(line => line.split(" ")[1].canFind('x')).array;
@@ -120,12 +129,9 @@ class DDB {
             throw new Exception("Failed to parse /prof/pid/maps"); 
           }
           this.load_addr = text_section[0].until("-").to!(string).to!(ulong)(16);
-
-          return;
-      } 
-
-      // get register
-      if (target_running && !first_break) {
+          this.log("Program loaded at " ~ load_addr.toAddr());
+      } else {
+        // get register
         regs.length = 256;
         if (ptrace(PTRACE_GETREGS, pid, null, regs.ptr) != 0) {
           throw new Exception("[-]failed to get regsiter");
@@ -135,22 +141,16 @@ class DDB {
         this.log("break at 0x%x".format(this.ip));
       }
     }
+    
+    // remove all hardware breakpoints
+    void clearHBreakpoints() {
+      foreach (i, _; this.break_addrs) {
+        unset_hw_breakpoint_to(pid, cast(uint)i);
+      }
+      this.break_addrs.length = 0;
+    }
 
     void setBreakpoint(ulong addr) {
-      /*
-      if (break_addrs.length >= 4) {
-        this.log("Hardware breakpoint can be set at most four.", false);
-        return;
-      }
-
-      if (target_running) {
-        if (! set_hw_breakpoint_to(pid, addr, cast(int)break_addrs.length)) {
-          throw new Exception("[-]Failed to Set Haredware Breakpoint");
-        }
-      }
-      break_addrs ~= addr;
-      this.log("set hardware breakpoint at 0x%x".format(addr));
-      */
       wanna_breaks ~= addr;
     }
 
@@ -176,24 +176,6 @@ class DDB {
 
       return codes;
     }
-
-    bool printCodesUntilRet(ubyte[] opbytes, ulong addr) {
-      string[] opbytes_str = [];
-      auto irs = cs.disasm(opbytes, addr);
-      foreach (ir; irs) {
-        opbytes_str ~= ir.bytes.formatOpbytes();
-      }
-      // long pad_length = opbytes_str.map!(x => x.length).reduce!((a, b) => max(a, b));
-      const long pad_length = 32;
-
-      foreach (i, ir; irs) {
-        msg("0x%x\t%s\t%s %s".format(ir.addr, opbytes_str[i].leftJustifier(pad_length), ir.opcode, ir.operand));
-        if (ir.opcode == "ret") {
-          return true;
-        }
-      }
-      return false;
-}
 
     void disasmBytes(ubyte[] opbytes, ulong addr) {
       string[] opbytes_str = [];
@@ -223,6 +205,36 @@ class DDB {
       return false;
     }
 
+    bool cmdHBreak(string[] args) {
+      if (args.length == 0) {
+        this.log("<Usage>: hbreak addr", false);
+        return true;
+      }
+
+      ulong addr = 0;
+      try {
+        addr = parseAddr(args[0]);
+
+        if (break_addrs.length >= this.dregnum) {
+          this.log("Hardware breakpoint can be set at most %d.".format(this.dregnum), false);
+          return true;
+        }
+
+        if (target_running) {
+          if (! set_hw_breakpoint_to(pid, addr, cast(int)break_addrs.length)) {
+            throw new Exception("[-]Failed to Set Haredware Breakpoint");
+          }
+        }
+        break_addrs ~= addr;
+        this.log("set hardware breakpoint at 0x%x".format(addr));
+      }
+      catch (Exception e) {
+        this.log("invalid address: " ~ args[0], false);
+      }
+
+      return true;
+    }
+
 
     bool cmdBreak(string[] args) {
       if (args.length == 0) {
@@ -247,7 +259,7 @@ class DDB {
         return true;
       }
 
-      auto r = select_breakpoints(this.cs, ubyte[] opbytes, ulong func_addr, current_addr, this.numof_regs, this.wanna_breaks);
+      // auto r = select_breakpoints(this.cs, ubyte[] opbytes, ulong func_addr, current_addr, this.dregnum, this.wanna_breaks);
 
       ptrace(PTRACE_CONT, pid, null, null);
       return false;
@@ -273,61 +285,6 @@ class DDB {
         if (f.opbytes.length > 0) {
           msg("0x%x\t\t%s".format(f.addr, f.name));
         }
-      }
-      return true;
-    }
-
-    // create jump graph from specific function
-    bool cmdGengraph(string[] args) {
-      if (args.length < 1) {
-        this.log("<Usage>: jump_graph func [-a]", false);
-        return true;
-      }
-      auto fname = args[0];
-      if (fname !in this.funcs) {
-        this.log("no such function: " ~ fname, false);
-        return true;
-      }
-
-
-      // (bytes, jumpto)[addr]
-      auto graph = makeJumpgraph(this.funcs[fname], this.cs);
-      foreach (addr; graph.keys.sort) {
-        // addr: [{jumpto1,  jumpto2, ...}, {jumpfrom1, jumpfrom2, ...}]
-        string jumpto = "{%s}".format(graph[addr].jumpto.map!(x => "0x%x".format(x)).join(", "));
-        string jumpfrom = "{%s}".format(graph[addr].jumpfrom.map!(x => "0x%x".format(x)).join(", "));
-        string heading = "0x%x:[%s, %s]".format(addr, jumpto, jumpfrom);
-        this.msg(cast(string)heading);
-        
-        // if -a is specified, show disassemble of block
-        if (args.canFind("-a")) {
-          pushPrefix("   ");
-          disasmBytes(graph[addr][0], addr);
-          this.msg("");
-          popPrefix();
-        }
-      }
-      return true;
-    }
-
-    // main work
-    bool cmdAnalyze(string[] args) {
-      if (args.length < 1) {
-        this.log("<Usage>: banalyze func <break points>", false);
-        return true;
-      }
-      auto fname = args[0];
-      if (fname !in this.funcs) {
-        this.log("no such function: " ~ fname, false);
-        return true;
-      }
-
-      // (bytes, jumpto)[addr]
-      auto graph = makeJumpgraph(this.funcs[fname], this.cs);
-
-      ulong[] bps;
-      foreach (a; args[1..$]) {
-        bps ~= parseAddr(a);
       }
       return true;
     }
@@ -631,15 +588,6 @@ string formatOpbytes(ubyte[] bytes) {
   return buf.join(" ");
 }
 
-long linearSearch(E)(E[] range, E element) {
-  foreach (i, e; range) {
-    if (element == e) {
-      return i;
-    }
-  }
-  return -1;
-}
-
 
 /// return true if x including all bits of y 
 bool binaryIncluding(ulong x, ulong y) {
@@ -691,8 +639,6 @@ Tuple!(bool, ulong[]) search_break_set(uint numof_bpreg, ulong[][ulong]to_breaks
 
 /// かなりメインの処理。breakしたい点を受け取ってどこにbreakpointを設置するか決定する
 auto select_breakpoints(Capstone cs, ubyte[] opbytes, ulong func_addr, ulong current_addr, long numof_bpreg, ulong[] wanna_breaks) {
-  //TODO: wanna_breaks はいまblockのアドレスが渡されることを期待しているので、
-  // 実際の命令のアドレスを受け取ってblockのアドレスに変換するようにする
 
   // グラフを作る
   auto graph = makeJumpgraph(opbytes, func_addr, cs);
@@ -717,7 +663,7 @@ auto select_breakpoints(Capstone cs, ubyte[] opbytes, ulong func_addr, ulong cur
     ulong[][] addr_roots = [];
 
     foreach (i, r; roots) {
-      auto u = r.linearSearch(addr);
+      auto u = r.countUntil(addr);
       if (u != -1) {  // アドレスAを含む
         addr_roots ~= r[0..u+1];
       }
@@ -776,22 +722,17 @@ auto select_breakpoints(Capstone cs, ubyte[] opbytes, ulong func_addr, ulong cur
 
 void main(string[] args)
 {
-  if (args.length < 4) {
-    writefln("<Usage>%s <target> <numof_bpreg>", args[0]);
+  if (args.length < 3) {
+    writefln("<Usage>%s <target> <dregnum>", args[0]);
     return;
   }
-
-  auto elf = readELF(args[1]);
-  Capstone cs;
-  auto funcs = elf.functions();
-
-  if (cast(ELF32)(elf) !is null) {
-    cs = new Capstone(cs_arch.CS_ARCH_X86, cs_mode.CS_MODE_32);
-  } else if (cast(ELF64)(elf) !is null) {
-    cs = new Capstone(cs_arch.CS_ARCH_X86, cs_mode.CS_MODE_64);
+  
+  // ELF を解析
+  ddb = new DDB(args[1], args[2].to!int);
+  while (true) {
+    if (ddb.target_running) {
+      ddb.wait();
+    }
+    ddb.cmdRepl();
   }
-  auto funcname = args[2];
-  auto numof_bpreg = args[3].to!int;
-  auto wannabreaks = args[4..$].map!(parseAddr).array;
-
 }

@@ -2,6 +2,7 @@ module debugger.elf;
 
 import core.sys.linux.elf;
 import std.file;
+import std.format;
 import std.algorithm;
 import std.bitmanip;
 import debugger.exception;
@@ -31,7 +32,7 @@ ELF readELF(string filename) {
     case ELFCLASS64:
       return new ELF64(filename);
     default:
-      throw new DebuggerException("Neither ELF32 nor ELF64");
+      throw new DebuggerException("Neither ELF32 nor ELF64: EI_CLASS=%d".format(ehdr.e_ident[EI_CLASS]));
   }
   assert(0);
 }
