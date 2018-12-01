@@ -2,6 +2,7 @@ import std.stdio;
 import core.sys.posix.unistd;
 import std.process;
 import std.string;
+import std.datetime.stopwatch : StopWatch, AutoStart;
 import std.typecons;
 import std.conv;
 import std.file;
@@ -261,6 +262,8 @@ class DDB {
         return ;
       }
 
+      auto sw = StopWatch(AutoStart.yes);
+
       auto f = getCurrentFunc();
       if (f[0]) {
         auto r = select_breakpoints(this.cs, f[1].opbytes, f[1].addr, this.ip, this.dregnum, this.wanna_breaks);
@@ -278,6 +281,8 @@ class DDB {
 
         }
       }
+      sw.stop();
+      this.log("duraction: %dmsec".format(sw.peek.total!"msecs"()));
 
       ptrace(PTRACE_CONT, pid, null, null);
 
