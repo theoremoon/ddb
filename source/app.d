@@ -36,6 +36,7 @@ class DDB {
     pid_t pid = 0;
     ulong[] break_addrs = [];
     ulong[] wanna_breaks = [];
+    ulong[] temporary_breaks = [];
     ulong load_addr = 0x0;
     ubyte[] regs = [];
     ulong ip;
@@ -62,8 +63,9 @@ class DDB {
 
       this.command_table = [
         CmdEntry(["s", "start"], "tart target program", &cmdStart),
-        // CmdEntry(["b", "break"], "reserve hadware breakpoint at addr", &cmdBreak),
+        CmdEntry(["b", "break"], "reserve hadware breakpoint at addr", &cmdBreak),
         CmdEntry(["hb", "hbreak"], "set hadware breakpoint at addr", &cmdHBreak),
+        CmdEntry(["clear"], "clear all hardware breakpoint", &cmdClear),
         CmdEntry(["c", "cont", "continue"], "continue execution", &cmdContinue),
         CmdEntry(["fls", "funcs", "functions"], "list function symbols", &cmdFunctions),
         CmdEntry(["d", "dis", "disasm"], "disassemble function", &cmdDisasm),
@@ -129,7 +131,6 @@ class DDB {
             throw new Exception("Failed to parse /prof/pid/maps"); 
           }
           this.load_addr = text_section[0].until("-").to!(string).to!(ulong)(16);
-          this.log("Program loaded at " ~ load_addr.toAddr());
       } else {
         // get register
         regs.length = 256;
@@ -139,7 +140,23 @@ class DDB {
 
         this.ip = elf.registerOf(regs, (elf.bitLength == 64) ? "rip" : "eip");
         this.log("break at 0x%x".format(this.ip));
+
+        if (this.temporary_breaks.canFind(this.ip)) {
+          this.log("this is temporarily break");
+          continueTarget();
+          wait();
+        }
       }
+    }
+
+
+    auto getCurrentFunc() {
+      foreach (f; this.funcs) {
+        if (f.addr <= this.ip && this.ip < f.addr + f.opbytes.length) {
+          return tuple(true, f);
+        }
+      }
+      return tuple(false, debugger.Function());
     }
     
     // remove all hardware breakpoints
@@ -148,33 +165,11 @@ class DDB {
         unset_hw_breakpoint_to(pid, cast(uint)i);
       }
       this.break_addrs.length = 0;
+      this.temporary_breaks.length = 0;
     }
 
     void setBreakpoint(ulong addr) {
       wanna_breaks ~= addr;
-    }
-
-    ubyte[] getCodes(long addr, ulong len) {
-      import std.bitmanip;
-      import std.system : Endian;
-
-      auto addr2 = addr;
-      auto cnt = 0;
-      ubyte[] codes = [];
-
-      while (cnt < len) {
-        // peek machine code 4 or 8 bytes
-        auto code = ptrace(PTRACE_PEEKDATA, pid, cast(void*)addr, null);
-        addr += elf.bitLength / 8;
-        cnt += elf.bitLength / 8;
-
-        // convert returned machine codes (long) to ubyte[]
-        ubyte[] buf = new ubyte[]( code.sizeof );
-        std.bitmanip.write!(typeof(code), Endian.littleEndian)(buf, code, 0);
-        codes ~= buf;
-      }
-
-      return codes;
     }
 
     void disasmBytes(ubyte[] opbytes, ulong addr) {
@@ -235,6 +230,12 @@ class DDB {
       return true;
     }
 
+    bool cmdClear(string[] args) {
+      clearHBreakpoints();
+      this.msg("remove all hardware breakpoints");
+      return true;
+    }
+
 
     bool cmdBreak(string[] args) {
       if (args.length == 0) {
@@ -245,6 +246,7 @@ class DDB {
       ulong addr = 0;
       try {
         addr = parseAddr(args[0]);
+        this.msg("register break candidate " ~ addr.toAddr());
         setBreakpoint(addr);
       }
       catch (Exception e) {
@@ -253,15 +255,36 @@ class DDB {
       return true;
     }
 
-    bool cmdContinue(string[] args) {
+    void continueTarget() {
       if (!target_running) {
         this.log("program isn't running", false);
-        return true;
+        return ;
       }
 
-      // auto r = select_breakpoints(this.cs, ubyte[] opbytes, ulong func_addr, current_addr, this.dregnum, this.wanna_breaks);
+      auto f = getCurrentFunc();
+      if (f[0]) {
+        auto r = select_breakpoints(this.cs, f[1].opbytes, f[1].addr, this.ip, this.dregnum, this.wanna_breaks);
+        if (r[0]) {
+          clearHBreakpoints();
+          foreach (i, addr; r[1]) {
+            set_hw_breakpoint_to(pid, addr, cast(int)i);
+            if (this.wanna_breaks.canFind(addr)) {
+              this.log("[!]set breakpoint at: " ~ addr.toAddr());
+            } else {
+              this.log("[?]set breakpoint at: " ~ addr.toAddr());
+              this.temporary_breaks ~= addr;
+            }
+          }
+
+        }
+      }
 
       ptrace(PTRACE_CONT, pid, null, null);
+
+    }
+
+    bool cmdContinue(string[] args) {
+      continueTarget();
       return false;
     }
 
@@ -378,6 +401,17 @@ class DDB {
       }
     }
 }
+T[] noSortIntersection(T)(T[] xs, T[] ys) {
+  T[] ret = [];
+
+  foreach (x; xs) {
+    if (ys.canFind(x)) {
+      ret ~= x;
+    }
+  }
+
+  return ret;
+}
 ulong parseAddr(string addrstr) {
   if (addrstr.startsWith("0x") || addrstr.startsWith("0X")) {
     return addrstr[2..$].to!ulong(16);
@@ -493,8 +527,6 @@ AsmBlock[ulong] makeJumpgraph(ubyte[] opbytes, ulong addr, Capstone cs) {
 
 
 auto getRoots(AsmBlock[ulong] graph, ulong entry) {
-  /// IDEA: Node 毎に持たずとも root からの全経路みたいなのを持っておけばよいのでは？？
-  ///  ↑いまの探索でも自然にそうなる
   ulong[][][ulong] roots;  // 経路のリスト（をNode毎にもつ）
   int [ulong][ulong] loop_nodes;  // from, to の間に loop があることを示す（無向
   ulong[] exploring;  // 探索中であることを表すリスト
@@ -510,39 +542,16 @@ auto getRoots(AsmBlock[ulong] graph, ulong entry) {
     }
     exploring ~= addr; // このNodeを含む経路をたどっていることを示しておく
 
-    /*
-    == 省略される点にBreakPointを仕掛ける場合に、その点がなくなってしまうので死ぬ。それが治ったらこれをコメントインして ==
-    // 1個しかジャンプ先がない場合はそちらに処理を任せてこちらの情報は保存しない
-    if (graph[addr].jumpto.length == 1) {
-      auto to = graph[addr].jumpto[0];
-
-      // 探索中ならループするという情報だけを入れておく
-      if (exploring.canFind(to)) {
-        loop_nodes[addr][to] = 1;
-        exploring.popBack(); 
-        ulong[][] dummy;  // ここからの経路はないのでこうする
-        return dummy;
-      }
-
-      auto r = loopf(to);
-
-      // entryが存在しないとあとで死ぬ
-      if (addr == entry) {
-        roots[entry] = r;
-      }
-
-      exploring.popBack();  // たどり終えた
-      return r;
-    }
-    */
-
-
     ulong[][] node_roots = [];  // このNode からたどる経路
     // このNodeから伸びている先
     foreach (to; graph[addr].jumpto) {
       // 探索中ならループするという情報だけを入れておく
       if (exploring.canFind(to)) {
-        loop_nodes[addr][to] = 1;
+        if (to == entry) {
+          node_roots ~= [to];
+        } else {
+          loop_nodes[addr][to] = 1;
+        }
         continue;
       }
 
@@ -599,8 +608,7 @@ bool binaryIncluding(ulong x, ulong y) {
 // breakしたい点M > HardwareBreakpointの数N だとうまく行かないように見えるかもしれないが
 // 少なくともどこかに現在地の直後の点が存在するはずなので保証はある
 // でも失敗するかもしれないので一応 bool で成否を帰している
-Tuple!(bool, ulong[]) search_break_set(uint numof_bpreg, ulong[][ulong]to_breaks, ulong[ulong] breakpoint_binexpr) {
-  const uint ideal_binexpr = (1 << to_breaks.keys.length) - 1;
+Tuple!(bool, ulong[]) search_break_set(uint numof_bpreg, ulong[][ulong]to_breaks, ulong[ulong] breakpoint_binexpr, uint ideal_binexpr) {
   ulong[][] breakpoints = to_breaks.values;
   Tuple!(bool, ulong[]) delegate(ulong[], ulong, int) f;
 
@@ -677,8 +685,10 @@ auto select_breakpoints(Capstone cs, ubyte[] opbytes, ulong func_addr, ulong cur
     // なければそこにはBPしかけなくていい（＝＞たどり着けないということなので）
     ulong[] intersects = addr_roots[0];
     foreach (i; 1..addr_roots.length) {
-      intersects = setIntersection(intersects, addr_roots[i]).array;
+      // writeln(intersects.map!(toAddr).join(","), "    ", addr_roots[i].map!(toAddr).join(","));
+      intersects = noSortIntersection(intersects, addr_roots[i]);
     }
+    // writeln();
     to_breaks[addr] = intersects;
 
     // intersectsに含まれる各点がbreakできる個数を加算しておく
@@ -703,19 +713,22 @@ auto select_breakpoints(Capstone cs, ubyte[] opbytes, ulong func_addr, ulong cur
   foreach (ref breakpoints; to_breaks) {
     breakpoints.sort!((x, y) => breakpoint_breakablenums[x] < breakpoint_breakablenums[y]);
   }
-  
-  // foreach (addr, binexpr; breakpoint_binexpr) {
-  //   writefln("%s:  0b%08b", addr.toAddr(), binexpr);
-  // }
   // foreach (key, values; to_breaks) {
   //   write(key.toAddr() ~ ": ");
   //   writeln(values.map!(toAddr).join(", "));
   // }
+  
+  uint ideal_binexpr = 0;
+  foreach (j, addr; wanna_breaks) {
+    if (to_breaks.keys.canFind(addr)) {
+      ideal_binexpr |= (1 << j);
+    }
+  }
 
   // breakする点で探索する
   // breakしたい点M > HardwareBreakpointの数N だとうまく行かないように見えるかもしれないが
   // 少なくともどこかに現在地の直後の点が存在するはずなので保証はある
-  auto r = search_break_set(cast(uint)numof_bpreg, to_breaks, breakpoint_binexpr);
+  auto r = search_break_set(cast(uint)numof_bpreg, to_breaks, breakpoint_binexpr, ideal_binexpr);
   return r;
 }
 
